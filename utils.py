@@ -1,206 +1,205 @@
 import os
-import pandas as pd
+import warnings
 import numpy as np
-import joblib
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge, LinearRegression
-from sklearn.metrics import mean_squared_error
+import pandas as pd
+from scipy.stats import pearsonr
 
-# ---------------------- 高速数据加载 ----------------------
-def get_day_folders(data_path):
-    """获取所有日期文件夹（按日期升序）"""
-    folders = [
-        f for f in os.listdir(data_path) 
-        if os.path.isdir(os.path.join(data_path, f)) and f.isdigit()
+# ===================== 全局常量（唯一入口）=====================
+# 特征维度：原有7维 + 预留扩展位（新增特征只需修改这里和特征计算函数）
+FEATURE_CONFIG = {
+    "base": ["vol_ratio1", "price_ratio", "vol_ratio2"],
+    "diff": ["vol_diff", "price_diff", "vol_diff2"],
+    "other": ["time_period"],
+    # 新增特征直接加在对应分类下，例如：
+    # "base": ["vol_ratio1", "price_ratio", "vol_ratio2", "new_base_feat"],
+    # "custom": ["new_custom_feat1", "new_custom_feat2"]
+}
+# 自动计算总特征维度（无需手动改数字）
+FEATURE_DIM = sum(len(v) for v in FEATURE_CONFIG.values())
+
+TIME_PERIOD_BINS = [570, 600, 870, 900]
+PRICE_CLIP_RANGE = (-0.05, 0.05)
+
+LGB_PARAMS = {
+    'objective': 'regression',
+    'metric': 'mse',
+    'boosting_type': 'gbdt',
+    'learning_rate': 0.08,
+    'num_leaves': 20,
+    'max_depth': 6,
+    'min_child_samples': 20,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'reg_alpha': 0.01,
+    'reg_lambda': 0.01,
+    'n_estimators': 100,
+    'verbose': -1,
+    'n_jobs': -1,
+}
+
+DATA_PATH = "./data"
+MODEL_DIR = "./model_weights"
+CV_SPLITS = 3
+
+# ===================== 统一警告过滤 =====================
+def filter_warnings():
+    warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+    warnings.filterwarnings('ignore', category=FutureWarning, module='lightgbm')
+
+# ===================== 交易日文件夹 =====================
+def get_day_folders(data_path: str = DATA_PATH) -> list:
+    if not os.path.exists(data_path):
+        os.makedirs(data_path, exist_ok=True)
+        raise FileNotFoundError(f"数据目录 {data_path} 不存在，已创建，请放入数据")
+    days = [
+        d for d in os.listdir(data_path)
+        if os.path.isdir(os.path.join(data_path, d)) and d.strip().isdigit()
     ]
-    folders.sort(key=int)
-    return folders
+    days.sort(key=lambda x: int(x))
+    if not days:
+        raise ValueError(f"{data_path} 下无数字命名交易日文件夹")
+    return days
 
-def load_day_data_fast(data_path, day):
-    """修复：加载CSV时保留Time列，不设索引"""
+# ===================== 单天数据加载 =====================
+def load_day_data(day: str, data_path: str = DATA_PATH) -> dict:
     day_path = os.path.join(data_path, day)
-    data = {}
-    for stock in ['A', 'B', 'C', 'D', 'E']:
-        csv_path = os.path.join(day_path, f"{stock}.csv")
-        # 关键修复：index_col=False 确保Time列作为普通列读取，不被当成索引
-        df = pd.read_csv(csv_path, encoding='utf-8', index_col=False)
-        # 额外兜底：清理列名空格（防止有隐藏空格）
-        df.columns = df.columns.str.strip()
-        data[stock] = df
-    return data
+    required = ["A.csv", "B.csv", "C.csv", "D.csv", "E.csv"]
+    out = {}
+    for fname in required:
+        fp = os.path.join(day_path, fname)
+        if not os.path.exists(fp):
+            raise FileNotFoundError(f"缺失 {fp}")
+        try:
+            df = pd.read_csv(fp, encoding="utf-8")
+        except UnicodeDecodeError:
+            df = pd.read_csv(fp, encoding="gbk")
+        core = ["LastPrice", "TradeBuyVolume", "TradeSellVolume", "Return5min"]
+        for c in core:
+            if c not in df.columns:
+                raise ValueError(f"{fp} 缺少必需列 {c}")
+        df["LastPrice"] = df["LastPrice"].astype(np.float32)
+        df["TradeBuyVolume"] = df["TradeBuyVolume"].astype(np.int32)
+        df["TradeSellVolume"] = df["TradeSellVolume"].astype(np.int32)
+        df["Return5min"] = df["Return5min"].astype(np.float32)
+        if "time_period" not in df.columns:
+            df["time_period"] = 1.0
+        else:
+            df["time_period"] = df["time_period"].astype(np.float32)
+        df = df.dropna(how="all").reset_index(drop=True)
+        out[fname.split(".")[0]] = df
+    return out
 
-# ---------------------- 向量化特征计算（核心提速） ----------------------
+# ===================== 批量特征计算（训练阶段用）=====================
+def calculate_batch_features(df_E, df_A, df_B, df_C, df_D) -> np.ndarray:
+    """训练阶段批量计算特征（兼容原有逻辑）"""
+    n = len(df_E)
+    # 初始化特征矩阵（自动适配FEATURE_DIM）
+    feat = np.zeros((n, FEATURE_DIM), dtype=np.float32)
+    
+    # 基础数据提取
+    p = df_E["LastPrice"].values
+    buy = df_E["TradeBuyVolume"].values
+    sell = df_E["TradeSellVolume"].values
+    tp = df_E["time_period"].values
+    vol = buy + sell
+    safe = vol + 1e-8
 
-def calculate_features_fast(df_E, df_A, df_B, df_C, df_D):
-    """
-    最终修复版：适配CSV的Time列（8/9位数字，列名是Time）
-    """
-    # ===================== 1. 原有核心特征计算（完全保留） =====================
-    e_volume = df_E['TradeBuyVolume'] + df_E['TradeSellVolume']
-    e_volume_roll = e_volume.rolling(window=5, min_periods=1).mean().fillna(e_volume.mean())
-    volume_feature = e_volume / (e_volume_roll + 1e-8)
+    # 映射特征位置（按FEATURE_CONFIG顺序）
+    feat_idx = 0
+    # 1. 基础特征
+    feat[:, feat_idx] = vol / safe  # vol_ratio1
+    feat_idx += 1
+    feat[:, feat_idx] = (p / (p + 1e-8)) - 1.0  # price_ratio
+    feat_idx += 1
+    feat[:, feat_idx] = vol / safe  # vol_ratio2
+    feat_idx += 1
 
-    e_price_roll = df_E['LastPrice'].rolling(window=5, min_periods=1).mean().fillna(df_E['LastPrice'].mean())
-    pe_feature = (df_E['LastPrice'] / e_price_roll) - 1
+    # 2. 差分特征
+    feat[1:, feat_idx] = vol[1:] - vol[:-1]  # vol_diff
+    feat_idx += 1
+    feat[1:, feat_idx] = p[1:] - p[:-1]      # price_diff
+    feat_idx += 1
+    feat[1:, feat_idx] = vol[1:] - vol[:-1]  # vol_diff2
+    feat_idx += 1
 
-    e_order_volume = df_E['TradeBuyVolume'] + df_E['TradeSellVolume']
-    turnover_feature = (df_E['TradeBuyVolume'] + df_E['TradeSellVolume']) / (e_order_volume + 1e-8)
+    # 3. 其他特征
+    feat[:, feat_idx] = tp  # time_period
+    feat_idx += 1
 
-    volume_diff = volume_feature.diff().fillna(0)
-    price_diff = pe_feature.diff().fillna(0)
-    turnover_diff = turnover_feature.diff().fillna(0)
-
-    # ===================== 2. 解析Time列（8/9位数字，核心修复） =====================
-    def parse_time_num(time_num):
-        """解析8/9位数字时间：93000000→093000000，103000000→103000000"""
-        # 转整数再转字符串，避免科学计数法
-        time_str = str(int(time_num)).zfill(9)
-        # 前两位=小时，中间两位=分钟
-        hour = int(time_str[:2])
-        minute = int(time_str[2:4])
-        return hour, minute
-
-    # 解析Time列生成小时/分钟
-    df_E[['hour', 'minute']] = df_E['Time'].apply(
-        lambda x: pd.Series(parse_time_num(x))
-    )
-    # 计算当天第几分钟（9:30=570，10:00=600）
-    df_E['time_min'] = df_E['hour'] * 60 + df_E['minute']
-
-    # 划分日内时段（早盘/午盘/尾盘）
-    df_E['time_period'] = pd.cut(
-        df_E['time_min'],
-        bins=[570, 600, 870, 900],  # 9:30-10:00=早盘，10:00-14:30=午盘，14:30-15:00=尾盘
-        labels=[0, 1, 2],
-        right=False,
-        include_lowest=True
-    ).astype(float).fillna(1.0)  # 异常时间默认设为午盘
-
-    # ===================== 3. 合并特征（原有6维+1维时段特征） =====================
-    features = np.column_stack([
-        volume_feature.values, pe_feature.values, turnover_feature.values,
-        volume_diff.values, price_diff.values, turnover_diff.values,
-        df_E['time_period'].values
-    ]).astype(np.float32)
+    # 新增特征示例：直接在对应分类后加即可
+    # feat[:, feat_idx] = xxx  # new_custom_feat1
+    # feat_idx += 1
 
     # 异常值处理
-    features = np.where(np.isnan(features) | np.isinf(features), 0, features)
+    feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+    return feat
 
-    return features
+# ===================== 在线特征计算（预测阶段用）=====================
+def calculate_online_feature(E_row, last_vol: float, last_p: float) -> np.ndarray:
+    """
+    在线预测单条Tick特征计算（抽离自MyModel）
+    :param E_row: 当前Tick的E行数据（pd.Series）
+    :param last_vol: 上一轮成交量（用于差分）
+    :param last_p: 上一轮价格（用于差分）
+    :return: 单条特征向量（1D np.array）
+    """
+    # 基础数据提取（带异常值处理）
+    price_mean = 1e-8
+    p = E_row["LastPrice"] if not np.isnan(E_row["LastPrice"]) else price_mean
+    buy = E_row["TradeBuyVolume"] if not np.isnan(E_row["TradeBuyVolume"]) else 0
+    sell = E_row["TradeSellVolume"] if not np.isnan(E_row["TradeSellVolume"]) else 0
+    tp = E_row.get("time_period", 1.0)
+    vol = buy + sell
+    safe = vol + 1e-8
 
-# ---------------------- 评估与划分工具 ----------------------
-def evaluate_ic(my_preds, ground_truth):
-    """向量化计算IC值（信息系数，衡量预测与真实值的相关性）"""
-    my_preds = np.array(my_preds).astype(np.float32)
-    ground_truth = np.array(ground_truth).astype(np.float32)
-    
-    # 过滤无效值
-    mask = ~(np.isnan(my_preds) | np.isnan(ground_truth) | 
-             np.isinf(my_preds) | np.isinf(ground_truth))
-    if np.sum(mask) < 2:
+    # 初始化特征向量
+    feat = np.zeros(FEATURE_DIM, dtype=np.float32)
+    feat_idx = 0
+
+    # 1. 基础特征
+    feat[feat_idx] = vol / safe  # vol_ratio1
+    feat_idx += 1
+    feat[feat_idx] = (p / (p + 1e-8)) - 1.0  # price_ratio
+    feat_idx += 1
+    feat[feat_idx] = vol / safe  # vol_ratio2
+    feat_idx += 1
+
+    # 2. 差分特征（用缓存的上一轮值）
+    feat[feat_idx] = vol - last_vol  # vol_diff
+    feat_idx += 1
+    feat[feat_idx] = p - last_p      # price_diff
+    feat_idx += 1
+    feat[feat_idx] = vol - last_vol  # vol_diff2
+    feat_idx += 1
+
+    # 3. 其他特征
+    feat[feat_idx] = tp  # time_period
+    feat_idx += 1
+
+    # 新增特征示例：
+    # feat[feat_idx] = E_row.get("NewFeat", 0.0)  # 新增特征
+    # feat_idx += 1
+
+    # 异常值处理
+    feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+    return feat
+
+# ===================== IC 评估 =====================
+def evaluate_ic(y_true, y_pred) -> float:
+    if len(y_true) != len(y_pred):
+        raise ValueError("y_true/y_pred 长度不匹配")
+    if len(y_true) < 2:
         return 0.0
-    return np.corrcoef(my_preds[mask], ground_truth[mask])[0, 1]
+    ic, _ = pearsonr(y_true, y_pred)
+    return float(ic) if not np.isnan(ic) else 0.0
 
-def split_time_series_data(X, y, day_tick_counts, n_splits=3):
-    """
-    适配逐行预测的3折滑动窗口验证（修复索引越界问题）
-    Args:
-        X/y: 特征/标签矩阵
-        day_tick_counts: 每个交易日的Tick数（如[27601,27601,27601,27601,27601]）
-        n_splits: 折数（固定3）
-    Returns:
-        3折的(train_idx, val_idx)索引对
-    """
-    # 计算每个交易日的累计Tick索引
-    cum_ticks = [0]
-    total = 0
-    for cnt in day_tick_counts:
-        total += cnt
-        cum_ticks.append(total)
-    
-    # 适配5天数据的3折划分（核心修复）
-    splits = []
-    # 折1：训练前2天，验证第3天
-    splits.append((np.arange(cum_ticks[2]), np.arange(cum_ticks[2], cum_ticks[3])))
-    # 折2：训练前3天，验证第4天
-    splits.append((np.arange(cum_ticks[3]), np.arange(cum_ticks[3], cum_ticks[4])))
-    # 折3：训练前4天，验证第5天
-    splits.append((np.arange(cum_ticks[4]), np.arange(cum_ticks[4], cum_ticks[5])))
-    
-    return splits
-
-# ---------------------- 训练工具 ----------------------
-def train_linear_regression_core(X, y, day_tick_counts=None, n_splits=3, model_type="linear"):
-    """
-    线性回归核心训练逻辑（支持普通线性回归/Ridge）
-    Args:
-        X/y: 特征/标签矩阵
-        day_tick_counts: 每个交易日的Tick数（时序划分用）
-        n_splits: 交叉验证折数
-        model_type: 模型类型（linear/ridge）
-    Returns:
-        训练好的模型、scaler、验证指标
-    """
-    # 数据标准化
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # 时序交叉验证划分
-    if day_tick_counts is None:
-        # 兼容无交易日划分的场景
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-        tscv_splits = list(tscv.split(X_scaled))
-    else:
-        tscv_splits = split_time_series_data(X_scaled, y, day_tick_counts, n_splits)
-    
-    val_ic_list = []
-    val_mse_list = []
-
-    # 选择模型
-    if model_type == "ridge":
-        model_cls = Ridge(alpha=1.0, fit_intercept=True)
-    else:
-        model_cls = LinearRegression(fit_intercept=True)
-    final_model = model_cls.__class__(**model_cls.get_params())
-
-    print(f"\n开始{n_splits}折滑动窗口时序验证...")
-    for fold_idx, (train_idx, val_idx) in enumerate(tscv_splits):
-        # 拆分训练/验证集
-        X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
-        
-        # 训练模型
-        fold_model = model_cls.__class__(**model_cls.get_params())
-        fold_model.fit(X_train, y_train)
-        
-        # 逐Tick预测（模拟线上场景）
-        y_val_pred = fold_model.predict(X_val)
-        
-        # 计算评估指标
-        val_ic = evaluate_ic(y_val_pred, y_val)
-        val_mse = mean_squared_error(y_val, y_val_pred)
-        val_ic_list.append(val_ic)
-        val_mse_list.append(val_mse)
-        
-        print(f"折 {fold_idx+1} - IC: {val_ic:.4f}, MSE: {val_mse:.6f}")
-
-    # 全量训练最终模型
-    final_model.fit(X_scaled, y)
-    print(f"\n全量训练完成 - 权重: {final_model.coef_}, 截距: {final_model.intercept_}")
-    
-    # 计算平均验证指标
-    avg_ic = np.mean(val_ic_list)
-    avg_mse = np.mean(val_mse_list)
-    print(f"\n交叉验证结果：")
-    print(f"平均IC: {avg_ic:.4f} (±{np.std(val_ic_list):.4f})")
-    print(f"平均MSE: {avg_mse:.6f} (±{np.std(val_mse_list):.6f})")
-
-    # 保存模型权重
-    os.makedirs("./model_weights", exist_ok=True)
-    np.savez("./model_weights/linear_regression_weights.npz", 
-             coef=final_model.coef_, intercept=final_model.intercept_)
-    joblib.dump(scaler, "./model_weights/scaler.pkl")
-    print(f"\n权重已保存至: ./model_weights/linear_regression_weights.npz")
-
-    return final_model, scaler, (avg_ic, avg_mse)
+# ===================== 批量时间解析 =====================
+def parse_time_num_batch(time_nums):
+    s = np.char.zfill(time_nums.astype(str), 9)
+    h = np.vectorize(lambda x: int(x[:2]))(s)
+    m = np.vectorize(lambda x: int(x[2:4]))(s)
+    tm = h * 60 + m
+    out = np.ones_like(tm, dtype=np.float32)
+    out[(tm >= 570) & (tm < 600)] = 0.0
+    out[(tm >= 870) & (tm < 900)] = 2.0
+    return out
