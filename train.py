@@ -46,7 +46,8 @@ def run_time_series_cv(X, y):
 
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
-    days = get_day_folders(DATA_PATH)
+    ###days = get_day_folders(DATA_PATH)
+    days = [d for d in get_day_folders(DATA_PATH) if d != '5'] # 排除交易日 '5'，后面可以删掉这行
     print("交易日:", days)
 
     X_list = []

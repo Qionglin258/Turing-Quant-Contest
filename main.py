@@ -19,7 +19,8 @@ def run_test():
 
     # ========== 获取交易日列表 ==========
     try:
-        days = get_day_folders("./data")
+        ####days = get_day_folders("./data")，后面需要恢复
+        days = ['5']  # 仅测试交易日 '5'
         print(f"待处理交易日: {days}")
     except Exception as e:
         print(f"获取交易日文件夹失败: {e}")
