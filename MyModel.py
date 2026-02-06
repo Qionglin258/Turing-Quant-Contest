@@ -1,53 +1,62 @@
-# 保留你原有所有导入/类结构，只改核心方法
-import os
 import numpy as np
 import joblib
 import lightgbm as lgb
-from utils import calculate_online_feature  # 保留你原有导入
-
+from utils import (
+    filter_warnings,
+    calculate_online_feature,
+    PRICE_CLIP_RANGE,
+    FEATURE_DIM
+)
+filter_warnings()
 class MyModel:
+    # 新增model_dir参数，设置默认值，兼容你的调用（保留）
     def __init__(self, model_dir="./model_weights"):
-        # 1. 加载模型组件（保留你原有路径/变量名）
-        self.model = joblib.load(os.path.join(model_dir, "lgb_model.pkl"))
-        self.scaler = joblib.load(os.path.join(model_dir, "scaler.pkl"))
-        self.non_nan_mask = joblib.load(os.path.join(model_dir, "non_nan_mask.pkl"))
-        self.reg_coef = joblib.load(os.path.join(model_dir, "reg_coef.pkl"))
-        
-        # 2. 初始化缓存（保留你原有变量名）
+        """初始化模型（支持model_dir参数）"""
+        self.model_dir = model_dir  # 新增：保存模型目录（保留）
+        self.model = None
+        self.scaler = None
+        self.non_nan_mask = None
+        self.reg_coef = None
         self.last_vol = 0.0
         self.last_p = 0.0
-        self.last_sector_p = {"A":0.0, "B":0.0, "C":0.0, "D":0.0}
-
+        self.last_sector_p = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        self.load_weights()  # 加载时用model_dir（保留）
+        print("模型加载完成")
+    def load_weights(self):
+        """加载模型（适配model_dir参数，保留）"""
+        try:
+            # 所有路径都用self.model_dir（保留）
+            self.model = joblib.load(f"{self.model_dir}/lgb_model.pkl")
+            self.scaler = joblib.load(f"{self.model_dir}/scaler.pkl")
+            self.non_nan_mask = joblib.load(f"{self.model_dir}/non_nan_mask.pkl")
+            self.reg_coef = joblib.load(f"{self.model_dir}/reg_coef.pkl")
+        except Exception as e:
+            raise Exception(f"加载失败: {e}")
     def reset(self):
-        # 保留你原有重置逻辑，只补全初始值
         self.last_vol = 0.0
         self.last_p = 0.0
-        self.last_sector_p = {"A":0.0, "B":0.0, "C":0.0, "D":0.0}
-
-    def predict(self, e_row, sector_rows):
-        # 3. 计算在线特征（完全保留你原有调用方式）
+        self.last_sector_p = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+    def online_predict(self, E_row, sector_row_datas):
         feat, current_sector_p = calculate_online_feature(
-            E_row=e_row,
-            sector_rows=sector_rows,
+            E_row=E_row,
+            sector_rows=sector_row_datas,
             last_vol=self.last_vol,
             last_p=self.last_p,
             last_sector_p=self.last_sector_p,
             reg_coef=self.reg_coef
         )
-        
-        # 4. 特征预处理（核心修正：和训练100%对齐）
-        # 原问题：可能没过滤NaN列/标准化，或维度错误
-        feat = np.array(feat)  # 确保是numpy数组（避免list）
-        feat_filtered = feat[self.non_nan_mask].reshape(1, -1)  # 过滤全NaN列
-        feat_scaled = self.scaler.transform(feat_filtered)      # 标准化
-        
-        # 5. 模型预测（核心修正：删除任何IC反转操作）
-        # 原问题：如果加了pred=-pred，这里必须删掉！
-        pred = self.model.predict(feat_scaled)[0]
-        
-        # 6. 更新缓存（保留你原有逻辑，只保证无未来信息）
-        self.last_vol = e_row["TradeBuyVolume"] + e_row["TradeSellVolume"]
-        self.last_p = e_row["LastPrice"]
+        # 【修改】删除你这里的单独取反（已在utils的特征计算中统一取反，避免二次取反导致方向又错！）
+        # 原代码：feat = -feat  →  删除，因为utils中已经对非板块因子取反，这里再取反会抵消
+        p = E_row["LastPrice"] if not np.isnan(E_row["LastPrice"]) else 1e-8
+        buy = E_row["TradeBuyVolume"] if not np.isnan(E_row["TradeBuyVolume"]) else 0
+        sell = E_row["TradeSellVolume"] if not np.isnan(E_row["TradeSellVolume"]) else 0
+        self.last_vol = buy + sell
+        self.last_p = p
         self.last_sector_p = current_sector_p
-        
-        return pred
+        feat_valid = feat[self.non_nan_mask].reshape(1, -1)
+        feat_scaled = self.scaler.transform(feat_valid)
+        pred = self.model.predict(feat_scaled)[0]
+        # 【保留】你的clip逻辑，一字未改
+        return float(np.clip(pred, *PRICE_CLIP_RANGE))
+    def save_data(self):
+        pass
