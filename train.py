@@ -12,7 +12,7 @@ from utils import (
 def main():
     filter_warnings()
     # 加载交易日列表
-    days = [d for d in os.listdir(DATA_PATH) if os.path.isdir(os.path.join(DATA_PATH, d)) and d.strip().isdigit()]
+    days = [d for d in os.listdir(DATA_PATH) if os.path.isdir(os.path.join(DATA_PATH, d)) and d.strip().isdigit() and int(d) >= 1 and int(d) <= 4]###先排除5
     days.sort(key=lambda x: int(x))
     if not days:
         raise ValueError(f"{DATA_PATH} 下无有效交易日文件夹")

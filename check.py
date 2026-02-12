@@ -79,7 +79,7 @@ if __name__ == "__main__":
     TRUE_CSV = "./data/5/E.csv"    # 你的真实值CSV文件路径
     PRED_CSV = "./output/5/E.csv"    # 你的预测值CSV文件路径
     TRUE_COL = "Return5min"         # 真实收益率列名（改成你CSV中的列名，比如"利润率"）
-    PRED_COL = "pred"    # 预测收益率列名（改成你CSV中的列名）
+    PRED_COL = "prediction"    # 预测收益率列名（改成你CSV中的列名）
     # ======================================================================
     # 计算指标并打印结果
     try:
