@@ -13,7 +13,7 @@ def main():
     all_labels = []
     all_ic_results = {feat: [] for feat in FEATURE_CONFIG}
     
-    for day in days:
+    for day in ["1", "2", "3", "4"]:  # 记得改回来
         day_data = load_day_data(DATA_DIR, day)
         features, labels, single_ic = calculate_batch_features(day_data)
         

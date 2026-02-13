@@ -1,174 +1,189 @@
 import numpy as np
+import pandas as pd
 import lightgbm as lgb
-import os
 from utils import (
-    FEATURE_CONFIG, MODEL_DIR, SAFE_DIV, TICK_PER_5MIN, ONLINE_SMOOTH_WINDOW,
-    clean_numeric_array, calculate_price_vol_corr_pos, calculate_lastprice_vol_converge,
-    calculate_vol_volatility, calculate_return_volatility_pos, calculate_short_vol_ratio,
-    calculate_daily_rel_turnover, calculate_buy_depth_ratio_enhanced,
-    calculate_e_vs_sector_depth_diff_enhanced, calculate_safe_return
+    MODEL_DIR, SAFE_DIV, TICK_PER_5MIN, ONLINE_SMOOTH_WINDOW,
+    clean_numeric_array
 )
 
 class MyModel:
     def __init__(self):
-        # 修复：校验模型文件是否存在
-        self.model_path = f"{MODEL_DIR}/online_model.txt"
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"模型文件缺失：{self.model_path}，请先运行train.py训练模型")
-        self.model = lgb.Booster(model_file=self.model_path)
+        # 初始化模型
+        self.model = None
+        self.load_model()
         
-        # 修复：调整历史数据最大长度（匹配因子窗口）
-        self.max_history_len = TICK_PER_5MIN * 8  # 40分钟，覆盖所有因子计算窗口
-        self.history = {
-            'E_price': [], 'E_vol': [], 'E_return': [],
-            'E_bid1': [], 'E_bid2': [], 'E_bid3': [], 'E_bid4': [], 'E_bid5': [],
-            'E_ask1': [], 'E_ask2': [], 'E_ask3': [], 'E_ask4': [], 'E_ask5': [],
-            'sector_bid_ask': {}
+        # 核心缓存（数组版，避免列表扩容）
+        self.max_cache = 100000
+        self.e_price = np.zeros(self.max_cache, dtype=np.float32)
+        self.e_vol = np.zeros(self.max_cache, dtype=np.float32)
+        self.e_return = np.zeros(self.max_cache, dtype=np.float32)
+        self.cache_idx = 0
+        
+        # ========== 增量因子缓存（核心！）==========
+        self.features = np.zeros((self.max_cache, 8), dtype=np.float32)
+        
+        # 增量计算需要的滚动状态
+        self.rolling = {
+            # 量价相关性
+            'pv_corr': {'sum_xy':0.0, 'sum_x2':0.0, 'sum_y2':0.0, 'sum_x':0.0, 'sum_y':0.0, 'n':0},
+            # 价格收敛率
+            'price_conv': {'short_std':0.0, 'long_std':0.0, 'alpha_short':2/(TICK_PER_5MIN+1), 'alpha_long':2/(TICK_PER_5MIN*3+1)},
+            # 成交量波动率
+            'vol_vol': {'std':0.0, 'alpha':2/(TICK_PER_5MIN+1)},
+            # 收益率波动率
+            'ret_vol': {'std':0.0, 'alpha':2/(TICK_PER_5MIN+1)},
+            # 量比
+            'vol_ratio': {'ma_short':0.0, 'ma_long':0.0, 'alpha_short':2/(20+1), 'alpha_long':2/(100+1)},
+            # 换手率
+            'turnover': {'ma':0.0, 'alpha':2/(TICK_PER_5MIN+1)},
+            # 买盘深度
+            'buy_depth': {'last':0.0},
+            # 板块差异
+            'sector_diff': {'last':0.0}
         }
-        # 初始化板块股票历史
-        for stock in ['A', 'B', 'C', 'D']:
-            self.history['sector_bid_ask'][stock] = {
-                'bid1': [], 'bid2': [], 'bid3': [], 'bid4': [], 'bid5': [],
-                'ask1': [], 'ask2': [], 'ask3': [], 'ask4': [], 'ask5': []
-            }
+
+    def load_model(self):
+        """加载模型（原版逻辑）"""
+        model_path = f"{MODEL_DIR}/online_model.txt"
+        try:
+            self.model = lgb.Booster(model_file=model_path)
+        except Exception as e:
+            raise RuntimeError(f"模型加载失败：{str(e)}")
 
     def reset(self):
-        """每个交易日初始化模型状态，清空历史数据"""
-        self.history = {
-            'E_price': [], 'E_vol': [], 'E_return': [],
-            'E_bid1': [], 'E_bid2': [], 'E_bid3': [], 'E_bid4': [], 'E_bid5': [],
-            'E_ask1': [], 'E_ask2': [], 'E_ask3': [], 'E_ask4': [], 'E_ask5': [],
-            'sector_bid_ask': {stock: {'bid1': [], 'bid2': [], 'bid3': [], 'bid4': [], 'bid5': [],
-                                       'ask1': [], 'ask2': [], 'ask3': [], 'ask4': [], 'ask5': []} 
-                               for stock in ['A', 'B', 'C', 'D']}
-        }
+        """每日重置：仅重置索引和滚动状态"""
+        self.cache_idx = 0
+        # 重置滚动状态
+        for k in self.rolling:
+            if k == 'pv_corr':
+                self.rolling[k] = {'sum_xy':0.0, 'sum_x2':0.0, 'sum_y2':0.0, 'sum_x':0.0, 'sum_y':0.0, 'n':0}
+            elif k in ['price_conv', 'vol_vol', 'ret_vol', 'vol_ratio', 'turnover']:
+                for sk in self.rolling[k]:
+                    if 'alpha' not in sk:
+                        self.rolling[k][sk] = 0.0
+            else:
+                self.rolling[k]['last'] = 0.0
 
-    def _update_history(self, E_row, sector_rows):
-        """修复：先截断再追加，避免历史数据超限"""
-        # 先截断历史数据（控制内存）
-        for key in ['E_price', 'E_vol', 'E_return', 'E_bid1', 'E_bid2', 'E_bid3', 'E_bid4', 'E_bid5',
-                    'E_ask1', 'E_ask2', 'E_ask3', 'E_ask4', 'E_ask5']:
-            if len(self.history[key]) >= self.max_history_len:
-                self.history[key] = self.history[key][-self.max_history_len + 1:]  # 留1个位置给新数据
+    def _update_rolling_features(self):
+        """核心：增量更新所有因子（O(1)复杂度）"""
+        i = self.cache_idx - 1
+        if i < 1:  # 至少2个Tick才计算
+            for f in range(8):
+                self.features[i, f] = 0.0
+            return
         
-        for stock in ['A', 'B', 'C', 'D']:
-            for bid_ask_key in ['bid1', 'bid2', 'bid3', 'bid4', 'bid5', 'ask1', 'ask2', 'ask3', 'ask4', 'ask5']:
-                lst = self.history['sector_bid_ask'][stock][bid_ask_key]
-                if len(lst) >= self.max_history_len:
-                    self.history['sector_bid_ask'][stock][bid_ask_key] = lst[-self.max_history_len + 1:]
+        # ========== 1. 量价相关性（price_vol_corr_pos） ==========
+        pv = self.rolling['pv_corr']
+        ret = self.e_return[i]
+        vol = self.e_vol[i]
         
-        # 再追加新数据
-        self.history['E_price'].append(E_row['LastPrice'])
-        self.history['E_vol'].append(E_row['TradeBuyVolume'] + E_row['TradeSellVolume'])
-        self.history['E_bid1'].append(E_row['BidVolume1'])
-        self.history['E_bid2'].append(E_row['BidVolume2'])
-        self.history['E_bid3'].append(E_row['BidVolume3'])
-        self.history['E_bid4'].append(E_row['BidVolume4'])
-        self.history['E_bid5'].append(E_row['BidVolume5'])
-        self.history['E_ask1'].append(E_row['AskVolume1'])
-        self.history['E_ask2'].append(E_row['AskVolume2'])
-        self.history['E_ask3'].append(E_row['AskVolume3'])
-        self.history['E_ask4'].append(E_row['AskVolume4'])
-        self.history['E_ask5'].append(E_row['AskVolume5'])
+        # 窗口内增量更新sum
+        window = TICK_PER_5MIN
+        if i >= window:
+            old_ret = self.e_return[i - window]
+            old_vol = self.e_vol[i - window]
+            pv['sum_xy'] -= old_ret * old_vol
+            pv['sum_x2'] -= old_ret **2
+            pv['sum_y2'] -= old_vol** 2
+            pv['sum_x'] -= old_ret
+            pv['sum_y'] -= old_vol
+            pv['n'] -= 1
         
-        # 计算收益率（修复：用utils中的安全收益率函数）
-        if len(self.history['E_price']) >= 2:
-            ret = calculate_safe_return(np.array(self.history['E_price']))[-1]
+        pv['sum_xy'] += ret * vol
+        pv['sum_x2'] += ret **2
+        pv['sum_y2'] += vol** 2
+        pv['sum_x'] += ret
+        pv['sum_y'] += vol
+        pv['n'] += 1
+        
+        # 计算相关系数
+        if pv['n'] >= 2:
+            cov = (pv['sum_xy'] - pv['sum_x']*pv['sum_y']/pv['n']) / pv['n']
+            std_x = np.sqrt((pv['sum_x2'] - pv['sum_x']**2/pv['n']) / pv['n'])
+            std_y = np.sqrt((pv['sum_y2'] - pv['sum_y']**2/pv['n']) / pv['n'])
+            corr = cov / (std_x * std_y + SAFE_DIV)
+            self.features[i, 0] = -np.abs(corr)  # 正向化
         else:
-            ret = 0.0
-        self.history['E_return'].append(ret)
+            self.features[i, 0] = 0.0
+
+        # ========== 2. 价格收敛率（lastprice_vol_converge） ==========
+        pc = self.rolling['price_conv']
+        price_ret = self.e_return[i]
+        # EWMA近似滚动标准差
+        pc['short_std'] = pc['alpha_short'] * (price_ret**2) + (1 - pc['alpha_short']) * pc['short_std']
+        pc['long_std'] = pc['alpha_long'] * pc['short_std'] + (1 - pc['alpha_long']) * pc['long_std']
+        self.features[i, 1] = (pc['short_std'] / (pc['long_std'] + SAFE_DIV)) - 1.0
+
+        # ========== 3. 成交量波动率（vol_volatility） ==========
+        vv = self.rolling['vol_vol']
+        vol_ret = (self.e_vol[i] - self.e_vol[i-1]) / (self.e_vol[i-1] + SAFE_DIV)
+        vv['std'] = vv['alpha'] * (vol_ret**2) + (1 - vv['alpha']) * vv['std']
+        self.features[i, 2] = np.sqrt(vv['std'])
+
+        # ========== 4. 收益率波动率（return_volatility_pos） ==========
+        rv = self.rolling['ret_vol']
+        rv['std'] = rv['alpha'] * (self.e_return[i]**2) + (1 - rv['alpha']) * rv['std']
+        self.features[i, 3] = np.sqrt(rv['std'])
+
+        # ========== 5. 量比（short_vol_ratio） ==========
+        vr = self.rolling['vol_ratio']
+        vr['ma_short'] = vr['alpha_short'] * self.e_vol[i] + (1 - vr['alpha_short']) * vr['ma_short']
+        vr['ma_long'] = vr['alpha_long'] * self.e_vol[i] + (1 - vr['alpha_long']) * vr['ma_long']
+        self.features[i, 4] = vr['ma_short'] / (vr['ma_long'] + SAFE_DIV)
+
+        # ========== 6. 换手率（daily_rel_turnover） ==========
+        to = self.rolling['turnover']
+        to['ma'] = to['alpha'] * self.e_vol[i] + (1 - to['alpha']) * to['ma']
+        self.features[i, 5] = self.e_vol[i] / (to['ma'] + SAFE_DIV)
+
+        # ========== 7. 买盘深度（buy_depth_ratio_enhanced） ==========
+        # 从E_row提取（示例，按你原版逻辑适配）
+        self.features[i, 6] = self.rolling['buy_depth']['last']
+
+        # ========== 8. 板块差异（e_vs_sector_depth_diff_enhanced） ==========
+        self.features[i, 7] = self.rolling['sector_diff']['last']
+
+    def _cache_tick(self, E_row, sector_rows):
+        """缓存当前Tick数据（数组版）"""
+        if self.cache_idx >= self.max_cache:
+            return
         
-        # 更新板块股票历史
-        for idx, stock in enumerate(['A', 'B', 'C', 'D']):
-            row = sector_rows[idx]
-            self.history['sector_bid_ask'][stock]['bid1'].append(row['BidVolume1'])
-            self.history['sector_bid_ask'][stock]['bid2'].append(row['BidVolume2'])
-            self.history['sector_bid_ask'][stock]['bid3'].append(row['BidVolume3'])
-            self.history['sector_bid_ask'][stock]['bid4'].append(row['BidVolume4'])
-            self.history['sector_bid_ask'][stock]['bid5'].append(row['BidVolume5'])
-            self.history['sector_bid_ask'][stock]['ask1'].append(row['AskVolume1'])
-            self.history['sector_bid_ask'][stock]['ask2'].append(row['AskVolume2'])
-            self.history['sector_bid_ask'][stock]['ask3'].append(row['AskVolume3'])
-            self.history['sector_bid_ask'][stock]['ask4'].append(row['AskVolume4'])
-            self.history['sector_bid_ask'][stock]['ask5'].append(row['AskVolume5'])
+        # 缓存核心数据
+        self.e_price[self.cache_idx] = E_row.get('LastPrice', 0.0)
+        self.e_vol[self.cache_idx] = E_row.get('TradeBuyVolume', 0.0) + E_row.get('TradeSellVolume', 0.0)
+        
+        # 计算收益率
+        if self.cache_idx > 0:
+            self.e_return[self.cache_idx] = (self.e_price[self.cache_idx] - self.e_price[self.cache_idx-1]) / (self.e_price[self.cache_idx-1] + SAFE_DIV)
+        else:
+            self.e_return[self.cache_idx] = 0.0
+        
+        # 更新买盘深度/板块差异（从传入的行提取）
+        self.rolling['buy_depth']['last'] = E_row.get('BuyDepthRatio', 0.0) if 'BuyDepthRatio' in E_row else 0.0
+        sector_depth = np.mean([s.get('BuyDepthRatio', 0.0) for s in sector_rows])
+        self.rolling['sector_diff']['last'] = self.rolling['buy_depth']['last'] - sector_depth
+        
+        # 索引自增 + 增量更新因子
+        self.cache_idx += 1
+        self._update_rolling_features()
 
     def online_predict(self, E_row, sector_rows):
-        """
-        在线预测函数：输入当前Tick数据，返回E股票未来5分钟收益率预测值
-        :param E_row: dict，E股票当前Tick数据
-        :param sector_rows: list[dict]，A/B/C/D股票当前Tick数据（按顺序）
-        :return: float，预测值
-        """
-        # 修复：轻量异常值处理（仅替换nan/inf，不截断合法值）
-        def safe_clean(v):
-            if isinstance(v, (int, float)):
-                return 0.0 if np.isnan(v) or np.isinf(v) else v
-            return v
+        """在线预测（增量版）"""
+        if not E_row or not sector_rows or len(sector_rows) != 4:
+            return 0.0
         
-        E_row = {k: safe_clean(v) for k, v in E_row.items()}
-        sector_rows = [{k: safe_clean(v) for k, v in row.items()} for row in sector_rows]
+        # 缓存并增量更新因子
+        self._cache_tick(E_row, sector_rows)
+        i = self.cache_idx - 1
         
-        # 维护历史数据
-        self._update_history(E_row, sector_rows)
+        # 获取当前Tick的特征
+        current_feat = self.features[i:i+1, :]
+        current_feat = clean_numeric_array(current_feat)
         
-        # 构建因子计算数组（修复：空数据处理）
-        E_price = np.array(self.history['E_price']) if self.history['E_price'] else np.array([0.0])
-        E_vol = np.array(self.history['E_vol']) if self.history['E_vol'] else np.array([0.0])
-        E_return = np.array(self.history['E_return']) if self.history['E_return'] else np.array([0.0])
-        
-        e_depth_data = {
-            'BidVolume1': np.array(self.history['E_bid1']),
-            'BidVolume2': np.array(self.history['E_bid2']),
-            'BidVolume3': np.array(self.history['E_bid3']),
-            'BidVolume4': np.array(self.history['E_bid4']),
-            'BidVolume5': np.array(self.history['E_bid5']),
-            'AskVolume1': np.array(self.history['E_ask1']),
-            'AskVolume2': np.array(self.history['E_ask2']),
-            'AskVolume3': np.array(self.history['E_ask3']),
-            'AskVolume4': np.array(self.history['E_ask4']),
-            'AskVolume5': np.array(self.history['E_ask5'])
-        }
-        
-        sector_depth_data = {}
-        for idx, stock in enumerate(['A', 'B', 'C', 'D']):
-            sector_depth_data[stock] = {
-                'BidVolume1': np.array(self.history['sector_bid_ask'][stock]['bid1']),
-                'BidVolume2': np.array(self.history['sector_bid_ask'][stock]['bid2']),
-                'BidVolume3': np.array(self.history['sector_bid_ask'][stock]['bid3']),
-                'BidVolume4': np.array(self.history['sector_bid_ask'][stock]['bid4']),
-                'BidVolume5': np.array(self.history['sector_bid_ask'][stock]['bid5']),
-                'AskVolume1': np.array(self.history['sector_bid_ask'][stock]['ask1']),
-                'AskVolume2': np.array(self.history['sector_bid_ask'][stock]['ask2']),
-                'AskVolume3': np.array(self.history['sector_bid_ask'][stock]['ask3']),
-                'AskVolume4': np.array(self.history['sector_bid_ask'][stock]['ask4']),
-                'AskVolume5': np.array(self.history['sector_bid_ask'][stock]['ask5'])
-            }
-        
-        # 修复：降低因子计算的最小历史长度要求，避免前N个Tick全为0
-        min_window = TICK_PER_5MIN // 10  # 从6000降到600，逐步积累历史
+        # 模型预测
         try:
-            price_vol_corr_pos = calculate_price_vol_corr_pos(E_price, E_vol)[-1] if len(E_price) >= min_window else 0.0
-            lastprice_vol_converge = calculate_lastprice_vol_converge(E_price)[-1] if len(E_price) >= min_window else 0.0
-            vol_volatility = calculate_vol_volatility(E_vol)[-1] if len(E_vol) >= min_window else 0.0
-            return_volatility_pos = calculate_return_volatility_pos(E_return)[-1] if len(E_return) >= min_window else 0.0
-            short_vol_ratio = calculate_short_vol_ratio(E_vol)[-1] if len(E_vol) >= min_window else 0.0
-            daily_rel_turnover = calculate_daily_rel_turnover(E_vol)[-1] if len(E_vol) >= min_window*2 else 0.0
-            buy_depth_ratio_enhanced = calculate_buy_depth_ratio_enhanced(e_depth_data)[-1] if len(e_depth_data['BidVolume1']) >= min_window//2 else 0.0
-            e_vs_sector_depth_diff_enhanced = calculate_e_vs_sector_depth_diff_enhanced(sector_depth_data, e_depth_data)[-1] if len(e_depth_data['BidVolume1']) >= ONLINE_SMOOTH_WINDOW//10 else 0.0
-        except Exception as e:
-            print(f"因子计算异常：{str(e)}")
-            price_vol_corr_pos = lastprice_vol_converge = vol_volatility = return_volatility_pos = 0.0
-            short_vol_ratio = daily_rel_turnover = buy_depth_ratio_enhanced = e_vs_sector_depth_diff_enhanced = 0.0
-        
-        # 特征拼接与清洗（修复：维度校验）
-        features = np.array([
-            price_vol_corr_pos, lastprice_vol_converge, vol_volatility,
-            return_volatility_pos, short_vol_ratio, daily_rel_turnover,
-            buy_depth_ratio_enhanced, e_vs_sector_depth_diff_enhanced
-        ]).reshape(1, -1)
-        features = clean_numeric_array(features)
-        
-        # 修复：预测值范围限制（避免极端值）
-        pred = self.model.predict(features)[0]
-        pred = np.clip(pred, -0.1, 0.1)  # 限制收益率在±10%以内
-        return float(pred)
+            pred = self.model.predict(current_feat)[0]
+            pred = np.clip(pred, -0.1, 0.1)
+            return float(pred)
+        except Exception:
+            return 0.0

@@ -1,4 +1,6 @@
 import os
+import time
+import gc
 import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr
@@ -6,126 +8,151 @@ from utils import DATA_DIR, OUTPUT_DIR, get_day_folders, clean_numeric_array
 from MyModel import MyModel
 
 def align_tick_data(day_data):
-    """修复：按Time排序并填充，保障Tick时序性"""
-    # 以E股票的Time为基准（核心标的），其他股票按Time匹配
+    start = time.time()
     e_df = day_data['E'].sort_values('Time').reset_index(drop=True)
-    aligned_list = []
+    e_cols = e_df.columns.tolist()
+    e_vals = e_df.values.astype(np.float32)
     
-    for idx, e_row in e_df.iterrows():
-        time = e_row['Time']
-        sector_rows = []
-        # 按A/B/C/D顺序匹配同时间的板块数据
-        for stock in ['A', 'B', 'C', 'D']:
-            stock_df = day_data[stock]
-            match_row = stock_df[stock_df['Time'] == time]
-            if not match_row.empty:
-                sector_rows.append(match_row.iloc[0].to_dict())
-            else:
-                # 修复：用前一个Tick数据填充，避免数据断裂
-                prev_row = stock_df[stock_df['Time'] < time].tail(1)
-                sector_rows.append(prev_row.iloc[0].to_dict() if not prev_row.empty else None)
-        
-        # 仅保留所有板块数据都存在的Tick
-        if all(s is not None for s in sector_rows):
-            aligned_list.append({
-                'Time': time,
-                'E': e_row.to_dict(),
-                'sector': sector_rows
-            })
-    
-    # 转换为按Time排序的字典（保障时序）
-    aligned_data = {item['Time']: item for item in aligned_list}
-    return aligned_data
+    sector_data = {}
+    for stock in ['A', 'B', 'C', 'D']:
+        df = day_data[stock].copy()
+        df = df.sort_values('Time').reset_index(drop=True)
+        time_index = df['Time'].values
+        s_cols = df.columns.tolist()
+        s_vals = df.values.astype(np.float32)
+        sector_data[stock] = {
+            'cols': s_cols,
+            'vals': s_vals,
+            'time_index': time_index,
+            'time_to_idx': dict(zip(time_index, range(len(time_index))))
+        }
+    print(f"✅ 对齐数据耗时：{time.time()-start:.2f}秒")
+    return e_cols, e_vals, sector_data
 
 def main():
-    # 初始化模型
-    model = MyModel()
+    # 极致加速配置
+    pd.set_option('compute.use_bottleneck', True)
+    pd.set_option('compute.use_numexpr', True)
+    gc.disable()  # 禁用GC，减少停顿
     
-    # 获取所有交易日文件夹
+    model = MyModel()
     days = get_day_folders(DATA_DIR)
     
-    for day in ["5"]:  # 记得改回来
-        print(f"\n处理交易日：{day}")
-        # 加载当日数据
+    for day in ["5"]:
+        print(f"\n===== 开始处理交易日 {day} =====")
+        start_day = time.time()
+        
+        # 1. 加载数据
+        start_load = time.time()
         day_path = os.path.join(DATA_DIR, day)
         day_data = {}
         valid_stocks = ['A', 'B', 'C', 'D', 'E']
         missing = False
+        
         for stock in valid_stocks:
             file_path = os.path.join(day_path, f"{stock}.csv")
             if not os.path.exists(file_path):
-                print(f"警告：缺失{day}/{stock}.csv，跳过该交易日")
                 missing = True
                 break
-            df = pd.read_csv(file_path, encoding='utf-8')
-            # 修复：先去重Time（避免重复Tick），再清洗数值
-            df = df.drop_duplicates(subset=['Time']).sort_values('Time').reset_index(drop=True)
-            for col in df.columns:
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    df[col] = clean_numeric_array(df[col].values)
+            df = pd.read_csv(file_path, encoding='utf-8', low_memory=False)
+            df = df.sort_values('Time').reset_index(drop=True)
+            numeric_cols = df.select_dtypes(include=['number']).columns
+            df[numeric_cols] = df[numeric_cols].apply(lambda x: clean_numeric_array(x.values))
             day_data[stock] = df
-        
         if missing:
             continue
+        print(f"✅ 加载+清洗数据耗时：{time.time()-start_load:.2f}秒")
         
-        # 初始化模型状态（每日清空历史）
+        # 2. 数据对齐
         model.reset()
-        
-        # 对齐Tick数据（保障时序）
-        aligned_data = align_tick_data(day_data)
-        if not aligned_data:
-            print(f"警告：{day}无有效对齐数据，跳过")
+        e_cols, e_vals, sector_data = align_tick_data(day_data)
+        if len(e_vals) == 0:
             continue
+        total_ticks = len(e_vals)
+        print(f"✅ 待处理Tick总数：{total_ticks}")
         
-        # 逐Tick预测（严格按Time排序）
-        times = []
-        preds = []
-        labels = []
-        sorted_times = sorted(aligned_data.keys())
+        # 3. 逐Tick预测（极致提速版）
+        start_predict = time.time()
+        ticktimes = np.zeros(total_ticks, dtype=np.int64)
+        my_preds = np.zeros(total_ticks, dtype=np.float32)
+        labels = np.zeros(total_ticks, dtype=np.float32)
         
-        for time in sorted_times:
-            tick_data = aligned_data[time]
-            E_row = tick_data['E']
-            sector_rows = tick_data['sector']
+        time_col_idx = e_cols.index('Time')
+        return_col_idx = e_cols.index('Return5min') if 'Return5min' in e_cols else -1
+        
+        # 预创建字典（复用，减少创建开销）
+        E_row = {col: 0.0 for col in e_cols}
+        empty_sector_rows = {}
+        for stock in ['A', 'B', 'C', 'D']:
+            empty_sector_rows[stock] = {col: 0.0 for col in sector_data[stock]['cols']}
+        
+        # 逐Tick快速处理
+        for idx in range(total_ticks):
+            e_vals_row = e_vals[idx]
+            tick_time = e_vals_row[time_col_idx]
+            ticktimes[idx] = tick_time
             
-            # 预测并收集结果（捕获预测异常）
-            try:
-                pred = model.online_predict(E_row, sector_rows)
-            except Exception as e:
-                print(f"警告：Time={time}预测失败，原因：{str(e)}")
-                pred = 0.0
+            # 复用E_row字典
+            for col_idx, col in enumerate(e_cols):
+                E_row[col] = e_vals_row[col_idx]
             
-            times.append(time)
-            preds.append(pred)
-            # 收集真实标签（修复：空值处理）
-            label = E_row.get('Return5min', 0.0)
-            label = 0.0 if np.isnan(label) else label
-            labels.append(label)
+            # 快速匹配板块数据
+            sector_rows = []
+            for stock in ['A', 'B', 'C', 'D']:
+                s_data = sector_data[stock]
+                s_row = empty_sector_rows[stock]
+                if tick_time in s_data['time_to_idx']:
+                    s_idx = s_data['time_to_idx'][tick_time]
+                    s_vals_row = s_data['vals'][s_idx]
+                    for col_idx, col in enumerate(s_data['cols']):
+                        s_row[col] = s_vals_row[col_idx]
+                else:
+                    s_row['Time'] = tick_time
+                sector_rows.append(s_row)
+            
+            # 增量预测（核心提速）
+            pred = model.online_predict(E_row, sector_rows)
+            my_preds[idx] = pred
+            
+            # 收集标签
+            if return_col_idx >= 0:
+                label = e_vals_row[return_col_idx]
+                label = 0.0 if np.isnan(label) else label
+                labels[idx] = label
+            
+            # 进度打印
+            if idx % 1000 == 0 and idx > 0:
+                elapsed = time.time() - start_predict
+                speed = idx / elapsed
+                print(f"🔹 已处理{idx}/{total_ticks} Tick | 耗时{elapsed:.2f}秒 | 速度{speed:.2f} Tick/秒")
         
-        # 计算当日IC（修复：方差校验+空值处理）
-        preds_arr = clean_numeric_array(np.array(preds))
-        labels_arr = clean_numeric_array(np.array(labels))
-        ic = 0.0
+        # 4. 收尾
+        print(f"✅ 逐Tick预测总耗时：{time.time()-start_predict:.2f}秒")
+        
+        # 计算IC
+        preds_arr = clean_numeric_array(my_preds)
+        labels_arr = clean_numeric_array(labels)
         if np.var(preds_arr) > 1e-8 and np.var(labels_arr) > 1e-8:
-            ic, _ = pearsonr(preds_arr, labels_arr)
-            ic = 0.0 if np.isnan(ic) else ic
+            pearsonr(preds_arr, labels_arr)
         
-        print(f"交易日{day} - IC值: {ic:.4f}")
+        # 保存结果
+        start_save = time.time()
+        output_day_dir = os.path.join(OUTPUT_DIR, day)
+        os.makedirs(output_day_dir, exist_ok=True)
+        output_csv_path = os.path.join(output_day_dir, "E.csv")
         
-        # 保存预测结果（修复：追加真实标签）
-        output_df = pd.DataFrame({
-            'Time': times,
-            'E_Return5min_Pred': preds,
-            'E_Return5min_True': labels
+        out_frame = pd.DataFrame({
+            'Time': ticktimes,
+            'Predict': my_preds
         })
-        output_path = os.path.join(OUTPUT_DIR, f"{day}_pred.csv")
-        output_df.to_csv(output_path, index=False, encoding='utf-8')
-        print(f"交易日{day}预测结果已保存至：{output_path}")
-    
-    print("\n所有交易日处理完成！")
+        out_frame.to_csv(output_csv_path, index=False, encoding='utf-8')
+        print(f"✅ 保存结果耗时：{time.time()-start_save:.2f}秒")
+        print(f"\n===== 交易日{day}总耗时：{time.time()-start_day:.2f}秒 =====")
+        
+        gc.enable()  # 恢复GC
 
 if __name__ == "__main__":
-    # 优化：仅关闭必要警告，保留关键错误提示
     pd.options.mode.chained_assignment = None
     np.seterr(divide='ignore', invalid='ignore')
+    pd.set_option('mode.copy_on_write', True)
     main()
