@@ -32,7 +32,7 @@
 ## 快速开始
 ### 1. 环境准备
 ```bash
-# 安装依赖包（建议使用Python 3.14+）
+# 安装依赖包（建议使用Python 3.14）
 pip install -r requirements.txt
 ```
 
