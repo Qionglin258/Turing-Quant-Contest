@@ -154,5 +154,4 @@ def main():
 if __name__ == "__main__":
     pd.options.mode.chained_assignment = None
     np.seterr(divide='ignore', invalid='ignore')
-    pd.set_option('mode.copy_on_write', True)
     main()

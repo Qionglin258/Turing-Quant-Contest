@@ -2,15 +2,16 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from utils import (
-    MODEL_DIR, SAFE_DIV, TICK_PER_5MIN, ONLINE_SMOOTH_WINDOW,
-    clean_numeric_array
+    MODEL_DIR, SAFE_DIV, TICK_PER_5MIN,
+    clean_numeric_array, merge_double_predict  # 仅保留utils中存在的常量/函数
 )
 
 class MyModel:
     def __init__(self):
-        # 初始化模型
-        self.model = None
-        self.load_model()
+        # 初始化双模型（方向+强度）
+        self.dir_model = None
+        self.str_model = None
+        self.load_double_models()
         
         # 核心缓存（数组版，避免列表扩容）
         self.max_cache = 100000
@@ -42,13 +43,15 @@ class MyModel:
             'sector_diff': {'last':0.0}
         }
 
-    def load_model(self):
-        """加载模型（原版逻辑）"""
-        model_path = f"{MODEL_DIR}/online_model.txt"
+    def load_double_models(self):
+        """加载双目标模型（方向+强度）"""
+        dir_model_path = f"{MODEL_DIR}/dir_model.txt"
+        str_model_path = f"{MODEL_DIR}/strength_model.txt"
         try:
-            self.model = lgb.Booster(model_file=model_path)
+            self.dir_model = lgb.Booster(model_file=dir_model_path)
+            self.str_model = lgb.Booster(model_file=str_model_path)
         except Exception as e:
-            raise RuntimeError(f"模型加载失败：{str(e)}")
+            raise RuntimeError(f"双模型加载失败：{str(e)}\n请先运行train.py训练双模型！")
 
     def reset(self):
         """每日重置：仅重置索引和滚动状态"""
@@ -102,7 +105,7 @@ class MyModel:
             std_x = np.sqrt((pv['sum_x2'] - pv['sum_x']**2/pv['n']) / pv['n'])
             std_y = np.sqrt((pv['sum_y2'] - pv['sum_y']**2/pv['n']) / pv['n'])
             corr = cov / (std_x * std_y + SAFE_DIV)
-            self.features[i, 0] = -np.abs(corr)  # 正向化
+            self.features[i, 0] = np.abs(corr)  # 纯绝对值，无反向
         else:
             self.features[i, 0] = 0.0
 
@@ -118,26 +121,33 @@ class MyModel:
         vv = self.rolling['vol_vol']
         vol_ret = (self.e_vol[i] - self.e_vol[i-1]) / (self.e_vol[i-1] + SAFE_DIV)
         vv['std'] = vv['alpha'] * (vol_ret**2) + (1 - vv['alpha']) * vv['std']
-        self.features[i, 2] = np.sqrt(vv['std'])
+        self.features[i, 2] = np.sqrt(vv['std']) * np.sqrt(24*60/5)
 
         # ========== 4. 收益率波动率（return_volatility_pos） ==========
         rv = self.rolling['ret_vol']
         rv['std'] = rv['alpha'] * (self.e_return[i]**2) + (1 - rv['alpha']) * rv['std']
-        self.features[i, 3] = np.sqrt(rv['std'])
+        self.features[i, 3] = np.sqrt(rv['std']) * np.sqrt(24*60/5)
 
         # ========== 5. 量比（short_vol_ratio） ==========
         vr = self.rolling['vol_ratio']
         vr['ma_short'] = vr['alpha_short'] * self.e_vol[i] + (1 - vr['alpha_short']) * vr['ma_short']
         vr['ma_long'] = vr['alpha_long'] * self.e_vol[i] + (1 - vr['alpha_long']) * vr['ma_long']
-        self.features[i, 4] = vr['ma_short'] / (vr['ma_long'] + SAFE_DIV)
+        # 计算短期/长期量比 + 年化
+        vol_ratio = vr['ma_short'] / (vr['ma_long'] + SAFE_DIV)
+        self.features[i, 4] = vol_ratio * np.sqrt(24*60/5)
 
         # ========== 6. 换手率（daily_rel_turnover） ==========
         to = self.rolling['turnover']
         to['ma'] = to['alpha'] * self.e_vol[i] + (1 - to['alpha']) * to['ma']
-        self.features[i, 5] = self.e_vol[i] / (to['ma'] + SAFE_DIV)
+        # 相对换手率计算
+        daily_total_vol = np.sum(self.e_vol[:i+1]) + SAFE_DIV
+        share_cap = 1e8
+        daily_turnover = daily_total_vol / share_cap
+        rolling_turnover = to['ma'] / share_cap
+        avg_5day_turnover = rolling_turnover  # 简化：用EWMA近似5天平均
+        self.features[i, 5] = daily_turnover / (avg_5day_turnover + SAFE_DIV)
 
         # ========== 7. 买盘深度（buy_depth_ratio_enhanced） ==========
-        # 从E_row提取（示例，按你原版逻辑适配）
         self.features[i, 6] = self.rolling['buy_depth']['last']
 
         # ========== 8. 板块差异（e_vs_sector_depth_diff_enhanced） ==========
@@ -158,17 +168,52 @@ class MyModel:
         else:
             self.e_return[self.cache_idx] = 0.0
         
-        # 更新买盘深度/板块差异（从传入的行提取）
-        self.rolling['buy_depth']['last'] = E_row.get('BuyDepthRatio', 0.0) if 'BuyDepthRatio' in E_row else 0.0
-        sector_depth = np.mean([s.get('BuyDepthRatio', 0.0) for s in sector_rows])
-        self.rolling['sector_diff']['last'] = self.rolling['buy_depth']['last'] - sector_depth
+        # 更新买盘深度（适配utils中的计算逻辑）
+        buy_depth = (
+            E_row.get('BidVolume1', 0.0) + E_row.get('BidVolume2', 0.0) +
+            E_row.get('BidVolume3', 0.0) + E_row.get('BidVolume4', 0.0) +
+            E_row.get('BidVolume5', 0.0)
+        )
+        sell_depth = (
+            E_row.get('AskVolume1', 0.0) + E_row.get('AskVolume2', 0.0) +
+            E_row.get('AskVolume3', 0.0) + E_row.get('AskVolume4', 0.0) +
+            E_row.get('AskVolume5', 0.0)
+        )
+        total_depth = buy_depth + sell_depth + SAFE_DIV
+        depth_ratio = buy_depth / total_depth
+        # EWMA平滑（适配utils中的smooth_window=TICK_PER_5MIN//5）
+        alpha = 2/((TICK_PER_5MIN//5) + 1)
+        self.rolling['buy_depth']['last'] = alpha * depth_ratio + (1 - alpha) * self.rolling['buy_depth']['last']
+        
+        # 更新板块差异（适配utils中的计算逻辑）
+        sector_depth_ratios = []
+        for s_row in sector_rows:
+            s_buy_depth = (
+                s_row.get('BidVolume1', 0.0) + s_row.get('BidVolume2', 0.0) +
+                s_row.get('BidVolume3', 0.0) + s_row.get('BidVolume4', 0.0) +
+                s_row.get('BidVolume5', 0.0)
+            )
+            s_sell_depth = (
+                s_row.get('AskVolume1', 0.0) + s_row.get('AskVolume2', 0.0) +
+                s_row.get('AskVolume3', 0.0) + s_row.get('AskVolume4', 0.0) +
+                s_row.get('AskVolume5', 0.0)
+            )
+            s_total_depth = s_buy_depth + s_sell_depth + SAFE_DIV
+            sector_depth_ratios.append(s_buy_depth / s_total_depth)
+        sector_avg_depth = np.mean(sector_depth_ratios)
+        depth_diff = depth_ratio - sector_avg_depth
+        # 自适应平滑（适配utils中的逻辑）
+        diff_std = np.std([self.rolling['sector_diff']['last'], depth_diff]) if self.rolling['sector_diff']['last'] != 0 else 0.1
+        smooth_window = 600 if diff_std > 0.05 else 1200
+        alpha = 2/(smooth_window + 1)
+        self.rolling['sector_diff']['last'] = alpha * depth_diff + (1 - alpha) * self.rolling['sector_diff']['last']
         
         # 索引自增 + 增量更新因子
         self.cache_idx += 1
         self._update_rolling_features()
 
     def online_predict(self, E_row, sector_rows):
-        """在线预测（增量版）"""
+        """在线预测（双目标版）"""
         if not E_row or not sector_rows or len(sector_rows) != 4:
             return 0.0
         
@@ -176,14 +221,21 @@ class MyModel:
         self._cache_tick(E_row, sector_rows)
         i = self.cache_idx - 1
         
-        # 获取当前Tick的特征
+        # 获取当前Tick的特征（适配FEATURE_CONFIG顺序）
         current_feat = self.features[i:i+1, :]
         current_feat = clean_numeric_array(current_feat)
         
-        # 模型预测
+        # 双模型预测
         try:
-            pred = self.model.predict(current_feat)[0]
-            pred = np.clip(pred, -0.1, 0.1)
-            return float(pred)
-        except Exception:
+            # 方向模型：预测涨的概率
+            dir_pred = self.dir_model.predict(current_feat)[0]
+            # 强度模型：预测涨跌幅度绝对值
+            str_pred = self.str_model.predict(current_feat)[0]
+            # 合并双目标预测（使用utils中的合并逻辑）
+            final_pred = merge_double_predict(np.array([dir_pred]), np.array([str_pred]))[0]
+            # 限制预测范围
+            final_pred = np.clip(final_pred, -0.1, 0.1)
+            return float(final_pred)
+        except Exception as e:
+            print(f"预测异常（Tick {i}）：{e}")
             return 0.0
