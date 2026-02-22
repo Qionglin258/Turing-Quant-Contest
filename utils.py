@@ -41,28 +41,27 @@ LGB_PARAMS = {
 # 核心因子（删除2个无效因子 + 保留9个有效因子）
 FEATURE_CONFIG = [
     # 保留的因子（按加权系数排序）
-    'price_vol_corr_pos',              # 加权1.4
-    'short_vol_ratio',                 # 加权1.4
-    'lastprice_vol_converge',          # 加权1.4+1.1=最终1.5（按你需求叠加）
-    'stock_sector_capital_dev',        # 加权1.2 + 1.0=最终1.2
-    'return_volatility_pos',           # 加权1.2
-    'daily_rel_turnover',              # 加权1.0
-    'buy_depth_ratio_enhanced',        # 加权0.8
-    'vol_volatility',                  # 加权0.8
-    'e_vs_sector_depth_diff_enhanced'  # 加权0.8
+    'price_vol_corr_pos',
+    'short_vol_ratio',
+    'lastprice_vol_converge',
+    'stock_sector_capital_dev',
+    'return_volatility_pos',
+    'daily_rel_turnover',
+    'buy_depth_ratio_enhanced',
+    'vol_volatility',
+    'e_vs_sector_depth_diff_enhanced'  
 ]
 
-# 因子加权系数字典（按你的要求配置）
 FACTOR_WEIGHTS = {
-    'price_vol_corr_pos': 1.4,
-    'short_vol_ratio': 1.4,
-    'lastprice_vol_converge': 1.5,     # 1.4+1.1叠加后的值
-    'stock_sector_capital_dev': 1.2,
-    'return_volatility_pos': 1.2,
-    'daily_rel_turnover': 1.0,
-    'buy_depth_ratio_enhanced': 0.8,
+    'price_vol_corr_pos': 1.6,
+    'short_vol_ratio': 1.6,
+    'lastprice_vol_converge': 1.7,
+    'stock_sector_capital_dev': 0.7,
+    'return_volatility_pos': 1.0,
+    'daily_rel_turnover': 0.9,
+    'buy_depth_ratio_enhanced': 0.7,
     'vol_volatility': 0.8,
-    'e_vs_sector_depth_diff_enhanced': 0.8
+    'e_vs_sector_depth_diff_enhanced': 0.7
 }
 
 # ===================== 核心工具函数 =====================
