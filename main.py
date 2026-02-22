@@ -3,46 +3,53 @@ import time
 import gc
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr
 from utils import DATA_DIR, OUTPUT_DIR, get_day_folders, clean_numeric_array
 from MyModel import MyModel
 
 def align_tick_data(day_data):
+    """极致优化：返回数组而非字典，减少转换开销"""
     start = time.time()
+    # 处理E数据
     e_df = day_data['E'].sort_values('Time').reset_index(drop=True)
     e_cols = e_df.columns.tolist()
-    e_vals = e_df.values.astype(np.float32)
+    e_vals = e_df.values.astype(np.float32)  # 单精度浮点，减少内存
     
+    # 处理板块数据（提前构建索引+数组）
     sector_data = {}
     for stock in ['A', 'B', 'C', 'D']:
         df = day_data[stock].copy()
         df = df.sort_values('Time').reset_index(drop=True)
+        # 提前构建Time索引数组
         time_index = df['Time'].values
+        # 转换为数组（单精度）
         s_cols = df.columns.tolist()
         s_vals = df.values.astype(np.float32)
         sector_data[stock] = {
             'cols': s_cols,
             'vals': s_vals,
             'time_index': time_index,
-            'time_to_idx': dict(zip(time_index, range(len(time_index))))
+            'time_to_idx': dict(zip(time_index, range(len(time_index))))  # 预构建Time→索引映射
         }
     print(f"✅ 对齐数据耗时：{time.time()-start:.2f}秒")
     return e_cols, e_vals, sector_data
 
 def main():
-    # 极致加速配置
+    # 启用Pandas加速选项（核心优化）
     pd.set_option('compute.use_bottleneck', True)
     pd.set_option('compute.use_numexpr', True)
     gc.disable()  # 禁用GC，减少停顿
     
+    # 初始化模型
     model = MyModel()
+    
+    # 获取所有交易日文件夹
     days = get_day_folders(DATA_DIR)
     
-    for day in ["5"]:
-        print(f"\n===== 开始处理交易日 {day} =====")
+    for day in ["4","5"]:
+        print(f"\n===== 开始处理交易日 {day}（9因子+加权+低复杂度） =====")
         start_day = time.time()
         
-        # 1. 加载数据
+        # 1. 加载数据阶段
         start_load = time.time()
         day_path = os.path.join(DATA_DIR, day)
         day_data = {}
@@ -54,31 +61,37 @@ def main():
             if not os.path.exists(file_path):
                 missing = True
                 break
+            
+            # 极速CSV读取（低内存+向量化清洗）
             df = pd.read_csv(file_path, encoding='utf-8', low_memory=False)
             df = df.sort_values('Time').reset_index(drop=True)
+            
+            # 批量清洗数值列（向量化，替代逐列循环）
             numeric_cols = df.select_dtypes(include=['number']).columns
             df[numeric_cols] = df[numeric_cols].apply(lambda x: clean_numeric_array(x.values))
             day_data[stock] = df
+        
         if missing:
+            print(f"❌ 交易日{day}缺失数据，跳过")
             continue
         print(f"✅ 加载+清洗数据耗时：{time.time()-start_load:.2f}秒")
         
-        # 2. 数据对齐
+        # 2. 模型重置+数据对齐
         model.reset()
         e_cols, e_vals, sector_data = align_tick_data(day_data)
         if len(e_vals) == 0:
+            print(f"❌ 交易日{day}无E股数据，跳过")
             continue
         total_ticks = len(e_vals)
         print(f"✅ 待处理Tick总数：{total_ticks}")
         
-        # 3. 逐Tick预测（极致提速版）
+        # 3. 逐Tick预测（极致优化：数组遍历+预构建映射）
         start_predict = time.time()
         ticktimes = np.zeros(total_ticks, dtype=np.int64)
         my_preds = np.zeros(total_ticks, dtype=np.float32)
-        labels = np.zeros(total_ticks, dtype=np.float32)
         
+        # 获取列索引（仅保留Time列）
         time_col_idx = e_cols.index('Time')
-        return_col_idx = e_cols.index('Return5min') if 'Return5min' in e_cols else -1
         
         # 预创建字典（复用，减少创建开销）
         E_row = {col: 0.0 for col in e_cols}
@@ -114,28 +127,16 @@ def main():
             pred = model.online_predict(E_row, sector_rows)
             my_preds[idx] = pred
             
-            # 收集标签
-            if return_col_idx >= 0:
-                label = e_vals_row[return_col_idx]
-                label = 0.0 if np.isnan(label) else label
-                labels[idx] = label
-            
-            # 进度打印
+            # 进度打印（每1000个Tick）
             if idx % 1000 == 0 and idx > 0:
                 elapsed = time.time() - start_predict
                 speed = idx / elapsed
                 print(f"🔹 已处理{idx}/{total_ticks} Tick | 耗时{elapsed:.2f}秒 | 速度{speed:.2f} Tick/秒")
         
-        # 4. 收尾
+        # 4. 收尾阶段
         print(f"✅ 逐Tick预测总耗时：{time.time()-start_predict:.2f}秒")
         
-        # 计算IC
-        preds_arr = clean_numeric_array(my_preds)
-        labels_arr = clean_numeric_array(labels)
-        if np.var(preds_arr) > 1e-8 and np.var(labels_arr) > 1e-8:
-            pearsonr(preds_arr, labels_arr)
-        
-        # 保存结果
+        # 保存结果（仅保留Time和Predict列）
         start_save = time.time()
         output_day_dir = os.path.join(OUTPUT_DIR, day)
         os.makedirs(output_day_dir, exist_ok=True)
@@ -152,6 +153,8 @@ def main():
         gc.enable()  # 恢复GC
 
 if __name__ == "__main__":
+    # 关闭无关警告+启用加速
     pd.options.mode.chained_assignment = None
     np.seterr(divide='ignore', invalid='ignore')
+    pd.set_option('mode.copy_on_write', True)  # 减少内存拷贝
     main()
