@@ -7,7 +7,7 @@ from utils import DATA_DIR, OUTPUT_DIR, get_day_folders, clean_numeric_array
 from MyModel import MyModel
 
 def align_tick_data(day_data):
-    """极致优化：返回数组而非字典，减少转换开销（新增Time列处理）"""
+    """极致优化：返回数组而非字典，减少转换开销（兼容11因子）"""
     start = time.time()
     # 处理E数据
     e_df = day_data['E'].sort_values('Time').reset_index(drop=True)
@@ -39,19 +39,19 @@ def main():
     pd.set_option('compute.use_numexpr', True)
     gc.disable()  # 禁用GC，减少停顿
     
-    # 初始化模型
+    # 初始化模型（11因子版本）
     model = MyModel()
     
     # 获取所有交易日文件夹
     days = get_day_folders(DATA_DIR)
     
     # 可修改为需要预测的交易日（如["5"]或days）
-    predict_days = ["4", "5"]
+    predict_days = ["4","5"]
     if not predict_days:
         predict_days = [d for d in days if int(d) > 4]  # 预测5天及以后
     
     for day in predict_days:
-        print(f"\n===== 开始处理交易日 {day}（10因子+时段类别特征+新加权系数） =====")
+        print(f"\n===== 开始处理交易日 {day}（11因子+价格趋势斜率+时段类别特征） =====")
         start_day = time.time()
         
         # 1. 加载数据阶段
@@ -95,7 +95,7 @@ def main():
         ticktimes = np.zeros(total_ticks, dtype=np.int64)
         my_preds = np.zeros(total_ticks, dtype=np.float32)
         
-        # 获取列索引（新增Time列必选）
+        # 获取列索引（Time列必选）
         try:
             time_col_idx = e_cols.index('Time')
         except ValueError:
@@ -132,7 +132,7 @@ def main():
                     s_row['Time'] = tick_time
                 sector_rows.append(s_row)
             
-            # 增量预测（核心提速）
+            # 增量预测（核心提速，兼容11因子）
             pred = model.online_predict(E_row, sector_rows)
             my_preds[idx] = pred
             

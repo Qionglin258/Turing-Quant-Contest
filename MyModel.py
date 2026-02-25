@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+from sklearn.linear_model import LinearRegression
 from utils import (
     MODEL_DIR, SAFE_DIV, TICK_PER_5MIN, FACTOR_WEIGHTS, FEATURE_CONFIG,
     clean_numeric_array, merge_double_predict, get_trade_period_label
@@ -13,20 +14,20 @@ class MyModel:
         self.str_model = None
         self.load_double_models()
         
-        # 核心缓存（数组版，支持10个因子：9数值+1类别）
+        # 核心缓存（数组版，支持11个因子：10原因子+1价格趋势斜率）
         self.max_cache = 100000
         self.e_price = np.zeros(self.max_cache, dtype=np.float32)
         self.e_vol = np.zeros(self.max_cache, dtype=np.float32)
         self.e_return = np.zeros(self.max_cache, dtype=np.float32)
-        self.e_time = np.zeros(self.max_cache, dtype=np.int64)  # 新增：缓存时间戳
+        self.e_time = np.zeros(self.max_cache, dtype=np.int64)  # 缓存时间戳
         self.cache_idx = 0
         
-        # ========== 增量因子缓存（10个因子：9数值+1类别）==========
-        self.features = np.zeros((self.max_cache, 10), dtype=np.float32)
+        # ========== 增量因子缓存（11个因子：10原因子+1价格趋势斜率）==========
+        self.features = np.zeros((self.max_cache, 11), dtype=np.float32)
         
-        # 增量计算需要的滚动状态（保留9个有效因子 + 新增时段特征缓存）
+        # 增量计算需要的滚动状态（新增价格趋势斜率的滚动缓存）
         self.rolling = {
-            # 9个数值因子的滚动状态
+            # 9个原数值因子的滚动状态
             'pv_corr': {'sum_xy':0.0, 'sum_x2':0.0, 'sum_y2':0.0, 'sum_x':0.0, 'sum_y':0.0, 'n':0},
             'short_vol_ratio': {'ma_short':0.0, 'ma_long':0.0, 'alpha_short':2/(20+1), 'alpha_long':2/(100+1)},
             'price_conv': {'short_std':0.0, 'long_std':0.0, 'alpha_short':2/(TICK_PER_5MIN+1), 'alpha_long':2/(TICK_PER_5MIN*3+1)},
@@ -36,22 +37,29 @@ class MyModel:
             'buy_depth': {'last':0.0},
             'vol_vol': {'std':0.0, 'alpha':2/(TICK_PER_5MIN+1)},
             'sector_diff': {'last':0.0},
-            # 新增：时段特征无需滚动，仅缓存
-            'trade_period': {'last_label':0}
+            # 时段特征（类别）
+            'trade_period': {'last_label':0},
+            # ========== 新增：价格趋势斜率的滚动状态 ==========
+            'price_trend': {
+                'window': TICK_PER_5MIN//2,  # 3000tick窗口（和utils一致）
+                'price_buffer': [],          # 价格缓存队列
+                'lr_model': LinearRegression(),  # 线性回归模型
+                'last_slope': 0.0            # 上一个斜率值
+            }
         }
 
     def load_double_models(self):
-        """加载双目标模型（方向+强度，含类别特征）"""
+        """加载双目标模型（方向+强度，含11因子）"""
         dir_model_path = f"{MODEL_DIR}/online_dir_model.txt"
         str_model_path = f"{MODEL_DIR}/online_strength_model.txt"
         try:
             self.dir_model = lgb.Booster(model_file=dir_model_path)
             self.str_model = lgb.Booster(model_file=str_model_path)
         except Exception as e:
-            raise RuntimeError(f"双模型加载失败：{str(e)}\n请先运行train.py训练含时段特征的双模型！")
+            raise RuntimeError(f"双模型加载失败：{str(e)}\n请先运行train.py训练含价格趋势斜率的11因子模型！")
 
     def reset(self):
-        """每日重置：仅重置索引和滚动状态"""
+        """每日重置：仅重置索引和滚动状态（含价格趋势斜率）"""
         self.cache_idx = 0
         # 重置所有因子的滚动状态
         for k in self.rolling.keys():
@@ -65,18 +73,57 @@ class MyModel:
                 self.rolling[k] = {'e_capital':0.0, 'sector_avg_capital':0.0, 'alpha':2/(TICK_PER_5MIN//10+1)}
             elif k in ['buy_depth', 'sector_diff']:
                 self.rolling[k]['last'] = 0.0
-            elif k == 'trade_period':  # 新增：重置时段特征
+            elif k == 'trade_period':
                 self.rolling[k]['last_label'] = 0
+            # ========== 新增：重置价格趋势斜率 ==========
+            elif k == 'price_trend':
+                self.rolling[k] = {
+                    'window': TICK_PER_5MIN//2,
+                    'price_buffer': [],
+                    'lr_model': LinearRegression(),
+                    'last_slope': 0.0
+                }
+
+    def _update_price_trend_slope(self):
+        """增量计算价格趋势斜率（和utils的calculate_price_trend_slope逻辑一致）"""
+        i = self.cache_idx - 1
+        trend_cfg = self.rolling['price_trend']
+        window = trend_cfg['window']
+        
+        # 1. 更新价格缓存队列
+        trend_cfg['price_buffer'].append(self.e_price[i])
+        # 保持队列长度不超过window
+        if len(trend_cfg['price_buffer']) > window:
+            trend_cfg['price_buffer'].pop(0)
+        
+        # 2. 只有缓存足够时才计算斜率
+        if len(trend_cfg['price_buffer']) < window:
+            return 0.0
+        
+        # 3. 线性回归计算斜率（和utils逻辑一致）
+        try:
+            # 生成时间索引（0,1,2,...,window-1）
+            x = np.arange(window).reshape(-1, 1)
+            # 价格数据
+            y = np.array(trend_cfg['price_buffer']).reshape(-1, 1)
+            # 拟合线性回归
+            trend_cfg['lr_model'].fit(x, y)
+            # 斜率放大1000倍（和utils一致）
+            slope = trend_cfg['lr_model'].coef_[0][0] * 1000
+            trend_cfg['last_slope'] = slope
+            return slope
+        except:
+            return trend_cfg['last_slope']
 
     def _update_rolling_features(self):
-        """核心：增量更新10个因子（9数值+1类别）+ 新加权系数"""
+        """核心：增量更新11个因子（10原因子+1价格趋势斜率）+ 新加权系数"""
         i = self.cache_idx - 1
         if i < 1:  # 至少2个Tick才计算
-            for f in range(10):
+            for f in range(11):
                 self.features[i, f] = 0.0
             return
         
-        # ========== 1. 9个数值因子增量计算（按FEATURE_CONFIG顺序 + 新加权系数） ==========
+        # ========== 1. 9个原数值因子增量计算（按FEATURE_CONFIG顺序 + 原加权系数） ==========
         # 1.1 price_vol_corr_pos（量价相关性，取反+绝对值，加权1.6）
         pv = self.rolling['pv_corr']
         ret = self.e_return[i]
@@ -162,16 +209,20 @@ class MyModel:
         feat_val = self.rolling['sector_diff']['last']
         self.features[i, 8] = feat_val * FACTOR_WEIGHTS['e_vs_sector_depth_diff_enhanced']
 
-        # ========== 2. 新增：trade_period时段类别特征（加权1.0） ==========
+        # 1.10 trade_period（时段类别特征，加权1.0）
         period_label = self.rolling['trade_period']['last_label']
         self.features[i, 9] = period_label * FACTOR_WEIGHTS['trade_period']
 
+        # ========== 2. 新增：price_trend_slope（价格趋势斜率） ==========
+        slope_val = self._update_price_trend_slope()
+        self.features[i, 10] = slope_val * FACTOR_WEIGHTS['price_trend_slope']
+
     def _cache_tick(self, E_row, sector_rows):
-        """缓存当前Tick数据（新增Time列解析时段特征）"""
+        """缓存当前Tick数据（新增价格趋势斜率所需的价格缓存）"""
         if self.cache_idx >= self.max_cache:
             return
         
-        # 缓存核心数据（新增Time列）
+        # 缓存核心数据
         self.e_price[self.cache_idx] = E_row.get('LastPrice', 0.0)
         self.e_vol[self.cache_idx] = E_row.get('TradeBuyVolume', 0.0) + E_row.get('TradeSellVolume', 0.0)
         self.e_time[self.cache_idx] = E_row.get('Time', 0)  # 缓存数字格式时间戳
@@ -182,7 +233,7 @@ class MyModel:
         else:
             self.e_return[self.cache_idx] = 0.0
         
-        # ========== 新增：解析时段特征（调用utils中的get_trade_period_label） ==========
+        # 解析时段特征（调用utils中的get_trade_period_label）
         time_int = self.e_time[self.cache_idx]
         period_label = get_trade_period_label(np.array([time_int]))[0]  # 单值解析
         self.rolling['trade_period']['last_label'] = period_label
@@ -254,7 +305,7 @@ class MyModel:
         self._update_rolling_features()
 
     def online_predict(self, E_row, sector_rows):
-        """在线预测（10因子+时段类别特征+新加权系数+软阈值合并）"""
+        """在线预测（11因子+价格趋势斜率+新加权系数+软阈值合并）"""
         if not E_row or not sector_rows or len(sector_rows) != 4:
             return 0.0
         
@@ -262,11 +313,11 @@ class MyModel:
         self._cache_tick(E_row, sector_rows)
         i = self.cache_idx - 1
         
-        # 获取当前Tick的10个加权特征（适配FEATURE_CONFIG顺序：9数值+1类别）
+        # 获取当前Tick的11个加权特征（适配FEATURE_CONFIG顺序）
         current_feat = self.features[i:i+1, :]
         current_feat = clean_numeric_array(current_feat)
         
-        # 双模型预测（含类别特征的低复杂度模型）
+        # 双模型预测（含11因子的低复杂度模型）
         try:
             # 方向模型：预测涨的概率（0-1）
             dir_pred = self.dir_model.predict(current_feat)[0]

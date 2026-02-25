@@ -3,6 +3,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr
+from sklearn.linear_model import LinearRegression
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import MinMaxScaler
@@ -38,7 +39,7 @@ LGB_PARAMS = {
     'verbosity': -1
 }
 
-# 核心因子（删除2个无效因子 + 保留9个有效因子 + 新增1个时段特征）
+# 核心因子（新增价格趋势斜率）
 FEATURE_CONFIG = [
     # 保留的因子（按加权系数排序）
     'price_vol_corr_pos',
@@ -50,10 +51,11 @@ FEATURE_CONFIG = [
     'buy_depth_ratio_enhanced',
     'vol_volatility',
     'e_vs_sector_depth_diff_enhanced',
-    'trade_period'  # 新增：时段特征（类别特征）
+    'trade_period',  # 时段类别特征
+    'price_trend_slope'  # 新增：价格趋势斜率
 ]
 
-# 因子加权系数（时段特征无需加权，系数设为1.0）
+# 因子加权系数（给价格趋势斜率设合理权重）
 FACTOR_WEIGHTS = {
     'price_vol_corr_pos': 1.6,
     'short_vol_ratio': 1.6,
@@ -64,7 +66,8 @@ FACTOR_WEIGHTS = {
     'buy_depth_ratio_enhanced': 0.7,
     'vol_volatility': 0.8,
     'e_vs_sector_depth_diff_enhanced': 0.7,
-    'trade_period': 1.0  # 新增：时段特征加权系数
+    'trade_period': 1.0,
+    'price_trend_slope': 0.8
 }
 
 # ===================== 新增：适配数字格式时间的时段标签生成函数 =====================
@@ -119,6 +122,35 @@ def get_trade_period_label(time_int_series):
             period_label[i] = 0  # 异常值标记为0
 
     return period_label
+
+# ===================== 新增：价格趋势斜率计算函数 =====================
+def calculate_price_trend_slope(price_series, window=TICK_PER_5MIN//2):
+    """
+    计算价格趋势斜率：用线性回归拟合window窗口内的价格序列，返回斜率
+    window：默认取5分钟窗口的一半（3000tick），可根据数据密度调整
+    """
+    slope_series = np.zeros_like(price_series)
+    # 初始化线性回归模型
+    lr = LinearRegression()
+    
+    for i in range(window, len(price_series)):
+        # 取窗口内的价格数据
+        window_prices = price_series[i-window:i].reshape(-1, 1)
+        # 生成时间索引（0,1,2,...,window-1）
+        x = np.arange(window).reshape(-1, 1)
+        
+        try:
+            # 拟合线性回归
+            lr.fit(x, window_prices)
+            # 斜率即为趋势（乘以1000放大数值，便于模型学习）
+            slope = lr.coef_[0][0] * 1000
+            slope_series[i] = slope
+        except:
+            slope_series[i] = 0.0
+    
+    # 前window个值设为0
+    slope_series[:window] = 0.0
+    return clean_numeric_array(slope_series)
 
 # ===================== 核心工具函数 =====================
 def clean_numeric_array(arr):
@@ -280,7 +312,7 @@ def calculate_stock_sector_capital_dev(e_data, sector_data, window=TICK_PER_5MIN
     smooth_dev = pd.Series(capital_dev).rolling(window=window//10, min_periods=1).mean().values
     return clean_numeric_array(smooth_dev)
 
-# ===================== 批量特征整合（含因子加权+时段特征）=====================
+# ===================== 批量特征整合（含因子加权+时段特征+价格斜率）=====================
 def calculate_batch_features(day_data):
     e_data = day_data['E']
     e_price = e_data['LastPrice'].values
@@ -294,6 +326,9 @@ def calculate_batch_features(day_data):
         raise ValueError("数据中缺少Time列！请确保csv包含数字格式的交易时间列（如93005500）")
     trade_period = get_trade_period_label(e_data['Time'].values)
     
+    # ========== 计算价格趋势斜率 ==========
+    price_trend_slope = calculate_price_trend_slope(e_price)
+    
     # 计算所有保留的因子
     price_vol_corr_pos = calculate_price_vol_corr_pos(e_price, e_vol)
     lastprice_vol_converge = calculate_lastprice_vol_converge(e_price)
@@ -305,7 +340,7 @@ def calculate_batch_features(day_data):
     e_vs_sector_depth_diff_enhanced = calculate_e_vs_sector_depth_diff_enhanced(sector_data, e_data)
     stock_sector_capital_dev = calculate_stock_sector_capital_dev(e_data, sector_data)
     
-    # 整合因子（按FEATURE_CONFIG顺序，新增时段特征）
+    # 整合因子（按FEATURE_CONFIG顺序）
     features_list = [
         price_vol_corr_pos,
         short_vol_ratio,
@@ -316,7 +351,8 @@ def calculate_batch_features(day_data):
         buy_depth_ratio_enhanced,
         vol_volatility,
         e_vs_sector_depth_diff_enhanced,
-        trade_period  # 新增：时段特征列
+        trade_period,
+        price_trend_slope  # 新增价格趋势斜率
     ]
     
     # 因子加权（核心：按配置的系数加权）
@@ -334,7 +370,7 @@ def calculate_batch_features(day_data):
     # 双目标标签
     dir_target, strength_target = generate_double_target(labels)
     
-    # 单因子IC（仅保留有效因子，时段特征不计算IC）
+    # 单因子IC（价格趋势斜率参与IC计算）
     single_ic_results = {}
     for i, feat_name in enumerate(FEATURE_CONFIG):
         if feat_name == 'trade_period':  # 跳过时段特征的IC计算
