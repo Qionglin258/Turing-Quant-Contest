@@ -76,8 +76,8 @@ def calculate_ic_mse_r2(
 # 主函数：运行脚本时调用
 if __name__ == "__main__":
     # ===================== 这里是需要你手动修改的参数 =====================
-    TRUE_CSV = "./data/5/E.csv"    # 你的真实值CSV文件路径
-    PRED_CSV = "./output/5/E.csv"    # 你的预测值CSV文件路径
+    TRUE_CSV = "./data/4/E.csv"    # 你的真实值CSV文件路径
+    PRED_CSV = "./output/4/E.csv"    # 你的预测值CSV文件路径
     TRUE_COL = "Return5min"         # 真实收益率列名（改成你CSV中的列名，比如"利润率"）
     PRED_COL = "Predict"    # 预测收益率列名（改成你CSV中的列名）
     # ======================================================================

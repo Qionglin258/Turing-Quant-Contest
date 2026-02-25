@@ -20,7 +20,7 @@ OUTPUT_DIR = "./output"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# LGB参数（降低复杂度：减少叶子数、增加正则、降低迭代轮数）
+# LGB参数（删除categorical_feature，避免重复传参）
 LGB_PARAMS = {
     'objective': 'regression',
     'metric': 'mse',
@@ -38,7 +38,7 @@ LGB_PARAMS = {
     'verbosity': -1
 }
 
-# 核心因子（删除2个无效因子 + 保留9个有效因子）
+# 核心因子（删除2个无效因子 + 保留9个有效因子 + 新增1个时段特征）
 FEATURE_CONFIG = [
     # 保留的因子（按加权系数排序）
     'price_vol_corr_pos',
@@ -49,9 +49,11 @@ FEATURE_CONFIG = [
     'daily_rel_turnover',
     'buy_depth_ratio_enhanced',
     'vol_volatility',
-    'e_vs_sector_depth_diff_enhanced'  
+    'e_vs_sector_depth_diff_enhanced',
+    'trade_period'  # 新增：时段特征（类别特征）
 ]
 
+# 因子加权系数（时段特征无需加权，系数设为1.0）
 FACTOR_WEIGHTS = {
     'price_vol_corr_pos': 1.6,
     'short_vol_ratio': 1.6,
@@ -61,8 +63,62 @@ FACTOR_WEIGHTS = {
     'daily_rel_turnover': 0.9,
     'buy_depth_ratio_enhanced': 0.7,
     'vol_volatility': 0.8,
-    'e_vs_sector_depth_diff_enhanced': 0.7
+    'e_vs_sector_depth_diff_enhanced': 0.7,
+    'trade_period': 1.0  # 新增：时段特征加权系数
 }
+
+# ===================== 新增：适配数字格式时间的时段标签生成函数 =====================
+def get_trade_period_label(time_int_series):
+    """
+    专门解析数字格式时间：
+    输入示例：93005500 → 9:30:05.500；133104500 → 13:31:04.500
+    格式规则：HHMMSSXXX 或 HMMSSXXX（小时1-2位，分钟2位，秒2位，毫秒3位）
+    输出时段标签：
+    1=9:30-10:00、2=10:00-11:30、3=13:00-13:30、4=13:30-14:00、5=14:00-14:50
+    """
+    period_label = np.zeros(len(time_int_series), dtype=int)
+
+    for i, t in enumerate(time_int_series):
+        try:
+            # 转为字符串并处理空值/异常值
+            s = str(int(t)) if not pd.isna(t) else ""
+            if len(s) < 6:  # 长度不足的异常值标记为0
+                period_label[i] = 0
+                continue
+            
+            # 解析规则：最后3位是毫秒，前面是HHMMSS/HMMSS
+            ms_part = s[-3:]  # 毫秒（固定3位）
+            hhmmss_part = s[:-3]  # 时-分-秒部分
+            
+            # 从后往前解析：秒(2位) → 分钟(2位) → 剩下的是小时
+            sec = hhmmss_part[-2:] if len(hhmmss_part) >=2 else "00"
+            minute = hhmmss_part[-4:-2] if len(hhmmss_part) >=4 else "00"
+            hour = hhmmss_part[:-4] if len(hhmmss_part) >=4 else hhmmss_part[:-2]
+            
+            # 转为整数（处理空值/非数字）
+            h = int(hour) if hour.isdigit() else 0
+            m = int(minute) if minute.isdigit() else 0
+            
+            # 计算当天总分钟数
+            total_min = h * 60 + m
+            
+            # 划分时段标签
+            if 9*60+30 <= total_min < 10*60:          # 9:30-10:00
+                period_label[i] = 1
+            elif 10*60 <= total_min < 11*60+30:       # 10:00-11:30
+                period_label[i] = 2
+            elif 13*60 <= total_min < 13*60+30:       # 13:00-13:30
+                period_label[i] = 3
+            elif 13*60+30 <= total_min < 14*60:       # 13:30-14:00
+                period_label[i] = 4
+            elif 14*60 <= total_min < 14*60+50:       # 14:00-14:50
+                period_label[i] = 5
+            else:                                       # 其他时段
+                period_label[i] = 0
+        except Exception as e:
+            period_label[i] = 0  # 异常值标记为0
+
+    return period_label
 
 # ===================== 核心工具函数 =====================
 def clean_numeric_array(arr):
@@ -224,7 +280,7 @@ def calculate_stock_sector_capital_dev(e_data, sector_data, window=TICK_PER_5MIN
     smooth_dev = pd.Series(capital_dev).rolling(window=window//10, min_periods=1).mean().values
     return clean_numeric_array(smooth_dev)
 
-# ===================== 批量特征整合（含因子加权）=====================
+# ===================== 批量特征整合（含因子加权+时段特征）=====================
 def calculate_batch_features(day_data):
     e_data = day_data['E']
     e_price = e_data['LastPrice'].values
@@ -232,6 +288,11 @@ def calculate_batch_features(day_data):
     e_return = calculate_safe_return(e_price)
     e_return5min = e_data['Return5min'].values if 'Return5min' in e_data.columns else np.zeros_like(e_price)
     sector_data = {s: day_data[s] for s in ['A', 'B', 'C', 'D']}
+    
+    # ========== 生成时段特征（适配数字格式Time列） ==========
+    if 'Time' not in e_data.columns:
+        raise ValueError("数据中缺少Time列！请确保csv包含数字格式的交易时间列（如93005500）")
+    trade_period = get_trade_period_label(e_data['Time'].values)
     
     # 计算所有保留的因子
     price_vol_corr_pos = calculate_price_vol_corr_pos(e_price, e_vol)
@@ -244,7 +305,7 @@ def calculate_batch_features(day_data):
     e_vs_sector_depth_diff_enhanced = calculate_e_vs_sector_depth_diff_enhanced(sector_data, e_data)
     stock_sector_capital_dev = calculate_stock_sector_capital_dev(e_data, sector_data)
     
-    # 整合因子（按FEATURE_CONFIG顺序）
+    # 整合因子（按FEATURE_CONFIG顺序，新增时段特征）
     features_list = [
         price_vol_corr_pos,
         short_vol_ratio,
@@ -254,7 +315,8 @@ def calculate_batch_features(day_data):
         daily_rel_turnover,
         buy_depth_ratio_enhanced,
         vol_volatility,
-        e_vs_sector_depth_diff_enhanced
+        e_vs_sector_depth_diff_enhanced,
+        trade_period  # 新增：时段特征列
     ]
     
     # 因子加权（核心：按配置的系数加权）
@@ -272,9 +334,12 @@ def calculate_batch_features(day_data):
     # 双目标标签
     dir_target, strength_target = generate_double_target(labels)
     
-    # 单因子IC（仅保留有效因子）
+    # 单因子IC（仅保留有效因子，时段特征不计算IC）
     single_ic_results = {}
     for i, feat_name in enumerate(FEATURE_CONFIG):
+        if feat_name == 'trade_period':  # 跳过时段特征的IC计算
+            single_ic_results[feat_name] = 0.0
+            continue
         feat = features[:, i]
         if np.var(feat) < SAFE_DIV or np.var(labels) < SAFE_DIV:
             single_ic_results[feat_name] = 0.0

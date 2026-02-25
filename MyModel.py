@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from utils import (
-    MODEL_DIR, SAFE_DIV, TICK_PER_5MIN, FACTOR_WEIGHTS,
-    clean_numeric_array, merge_double_predict
+    MODEL_DIR, SAFE_DIV, TICK_PER_5MIN, FACTOR_WEIGHTS, FEATURE_CONFIG,
+    clean_numeric_array, merge_double_predict, get_trade_period_label
 )
 
 class MyModel:
@@ -13,19 +13,20 @@ class MyModel:
         self.str_model = None
         self.load_double_models()
         
-        # 核心缓存（数组版，支持9个因子）
+        # 核心缓存（数组版，支持10个因子：9数值+1类别）
         self.max_cache = 100000
         self.e_price = np.zeros(self.max_cache, dtype=np.float32)
         self.e_vol = np.zeros(self.max_cache, dtype=np.float32)
         self.e_return = np.zeros(self.max_cache, dtype=np.float32)
+        self.e_time = np.zeros(self.max_cache, dtype=np.int64)  # 新增：缓存时间戳
         self.cache_idx = 0
         
-        # ========== 增量因子缓存（9个因子）==========
-        self.features = np.zeros((self.max_cache, 9), dtype=np.float32)
+        # ========== 增量因子缓存（10个因子：9数值+1类别）==========
+        self.features = np.zeros((self.max_cache, 10), dtype=np.float32)
         
-        # 增量计算需要的滚动状态（仅保留9个有效因子）
+        # 增量计算需要的滚动状态（保留9个有效因子 + 新增时段特征缓存）
         self.rolling = {
-            # 9个有效因子的滚动状态
+            # 9个数值因子的滚动状态
             'pv_corr': {'sum_xy':0.0, 'sum_x2':0.0, 'sum_y2':0.0, 'sum_x':0.0, 'sum_y':0.0, 'n':0},
             'short_vol_ratio': {'ma_short':0.0, 'ma_long':0.0, 'alpha_short':2/(20+1), 'alpha_long':2/(100+1)},
             'price_conv': {'short_std':0.0, 'long_std':0.0, 'alpha_short':2/(TICK_PER_5MIN+1), 'alpha_long':2/(TICK_PER_5MIN*3+1)},
@@ -34,23 +35,25 @@ class MyModel:
             'turnover': {'ma':0.0, 'alpha':2/(TICK_PER_5MIN+1)},
             'buy_depth': {'last':0.0},
             'vol_vol': {'std':0.0, 'alpha':2/(TICK_PER_5MIN+1)},
-            'sector_diff': {'last':0.0}
+            'sector_diff': {'last':0.0},
+            # 新增：时段特征无需滚动，仅缓存
+            'trade_period': {'last_label':0}
         }
 
     def load_double_models(self):
-        """加载双目标模型（方向+强度）"""
+        """加载双目标模型（方向+强度，含类别特征）"""
         dir_model_path = f"{MODEL_DIR}/online_dir_model.txt"
         str_model_path = f"{MODEL_DIR}/online_strength_model.txt"
         try:
             self.dir_model = lgb.Booster(model_file=dir_model_path)
             self.str_model = lgb.Booster(model_file=str_model_path)
         except Exception as e:
-            raise RuntimeError(f"双模型加载失败：{str(e)}\n请先运行train.py训练双模型！")
+            raise RuntimeError(f"双模型加载失败：{str(e)}\n请先运行train.py训练含时段特征的双模型！")
 
     def reset(self):
         """每日重置：仅重置索引和滚动状态"""
         self.cache_idx = 0
-        # 重置9个因子的滚动状态
+        # 重置所有因子的滚动状态
         for k in self.rolling.keys():
             if k == 'pv_corr':
                 self.rolling[k] = {'sum_xy':0.0, 'sum_x2':0.0, 'sum_y2':0.0, 'sum_x':0.0, 'sum_y':0.0, 'n':0}
@@ -60,19 +63,21 @@ class MyModel:
                         self.rolling[k][sk] = 0.0
             elif k == 'capital_dev':
                 self.rolling[k] = {'e_capital':0.0, 'sector_avg_capital':0.0, 'alpha':2/(TICK_PER_5MIN//10+1)}
-            else:  # buy_depth, sector_diff
+            elif k in ['buy_depth', 'sector_diff']:
                 self.rolling[k]['last'] = 0.0
+            elif k == 'trade_period':  # 新增：重置时段特征
+                self.rolling[k]['last_label'] = 0
 
     def _update_rolling_features(self):
-        """核心：增量更新9个因子（O(1)复杂度）+ 因子加权"""
+        """核心：增量更新10个因子（9数值+1类别）+ 新加权系数"""
         i = self.cache_idx - 1
         if i < 1:  # 至少2个Tick才计算
-            for f in range(9):
+            for f in range(10):
                 self.features[i, f] = 0.0
             return
         
-        # ========== 1. 9个因子增量计算（按FEATURE_CONFIG顺序） ==========
-        # 1.1 price_vol_corr_pos（量价相关性，取反+绝对值）
+        # ========== 1. 9个数值因子增量计算（按FEATURE_CONFIG顺序 + 新加权系数） ==========
+        # 1.1 price_vol_corr_pos（量价相关性，取反+绝对值，加权1.6）
         pv = self.rolling['pv_corr']
         ret = self.e_return[i]
         vol = self.e_vol[i]
@@ -101,10 +106,9 @@ class MyModel:
             feat_val = np.abs(corr)
         else:
             feat_val = 0.0
-        # 因子加权（核心）
         self.features[i, 0] = feat_val * FACTOR_WEIGHTS['price_vol_corr_pos']
 
-        # 1.2 short_vol_ratio（量比）
+        # 1.2 short_vol_ratio（量比，加权1.6）
         vr = self.rolling['short_vol_ratio']
         vr['ma_short'] = vr['alpha_short'] * self.e_vol[i] + (1 - vr['alpha_short']) * vr['ma_short']
         vr['ma_long'] = vr['alpha_long'] * self.e_vol[i] + (1 - vr['alpha_long']) * vr['ma_long']
@@ -112,7 +116,7 @@ class MyModel:
         feat_val = vol_ratio * np.sqrt(24*60/5)
         self.features[i, 1] = feat_val * FACTOR_WEIGHTS['short_vol_ratio']
 
-        # 1.3 lastprice_vol_converge（价格收敛率）
+        # 1.3 lastprice_vol_converge（价格收敛率，加权1.7）
         pc = self.rolling['price_conv']
         price_ret = self.e_return[i]
         pc['short_std'] = pc['alpha_short'] * (price_ret**2) + (1 - pc['alpha_short']) * pc['short_std']
@@ -120,19 +124,19 @@ class MyModel:
         feat_val = (pc['short_std'] / (pc['long_std'] + SAFE_DIV)) - 1.0
         self.features[i, 2] = feat_val * FACTOR_WEIGHTS['lastprice_vol_converge']
 
-        # 1.4 stock_sector_capital_dev（个股-板块资金偏离）
+        # 1.4 stock_sector_capital_dev（个股-板块资金偏离，加权0.7）
         cd = self.rolling['capital_dev']
         capital_dev = (cd['e_capital'] - cd['sector_avg_capital']) / (cd['sector_avg_capital'] + SAFE_DIV)
         feat_val = cd['alpha'] * capital_dev + (1 - cd['alpha']) * self.features[i-1, 3]  # 平滑
         self.features[i, 3] = feat_val * FACTOR_WEIGHTS['stock_sector_capital_dev']
 
-        # 1.5 return_volatility_pos（收益率波动率）
+        # 1.5 return_volatility_pos（收益率波动率，加权1.0）
         rv = self.rolling['ret_vol']
         rv['std'] = rv['alpha'] * (self.e_return[i]**2) + (1 - rv['alpha']) * rv['std']
         feat_val = np.sqrt(rv['std']) * np.sqrt(24*60/5)
         self.features[i, 4] = feat_val * FACTOR_WEIGHTS['return_volatility_pos']
 
-        # 1.6 daily_rel_turnover（相对换手率）
+        # 1.6 daily_rel_turnover（相对换手率，加权0.9）
         to = self.rolling['turnover']
         to['ma'] = to['alpha'] * self.e_vol[i] + (1 - to['alpha']) * to['ma']
         daily_total_vol = np.sum(self.e_vol[:i+1]) + SAFE_DIV
@@ -143,29 +147,34 @@ class MyModel:
         feat_val = daily_turnover / (avg_5day_turnover + SAFE_DIV)
         self.features[i, 5] = feat_val * FACTOR_WEIGHTS['daily_rel_turnover']
 
-        # 1.7 buy_depth_ratio_enhanced（买盘深度）
+        # 1.7 buy_depth_ratio_enhanced（买盘深度，加权0.7）
         feat_val = self.rolling['buy_depth']['last']
         self.features[i, 6] = feat_val * FACTOR_WEIGHTS['buy_depth_ratio_enhanced']
 
-        # 1.8 vol_volatility（成交量波动率）
+        # 1.8 vol_volatility（成交量波动率，加权0.8）
         vv = self.rolling['vol_vol']
         vol_ret = (self.e_vol[i] - self.e_vol[i-1]) / (self.e_vol[i-1] + SAFE_DIV)
         vv['std'] = vv['alpha'] * (vol_ret**2) + (1 - vv['alpha']) * vv['std']
         feat_val = np.sqrt(vv['std']) * np.sqrt(24*60/5)
         self.features[i, 7] = feat_val * FACTOR_WEIGHTS['vol_volatility']
 
-        # 1.9 e_vs_sector_depth_diff_enhanced（板块深度差异）
+        # 1.9 e_vs_sector_depth_diff_enhanced（板块深度差异，加权0.7）
         feat_val = self.rolling['sector_diff']['last']
         self.features[i, 8] = feat_val * FACTOR_WEIGHTS['e_vs_sector_depth_diff_enhanced']
 
+        # ========== 2. 新增：trade_period时段类别特征（加权1.0） ==========
+        period_label = self.rolling['trade_period']['last_label']
+        self.features[i, 9] = period_label * FACTOR_WEIGHTS['trade_period']
+
     def _cache_tick(self, E_row, sector_rows):
-        """缓存当前Tick数据（仅保留9个因子所需字段）"""
+        """缓存当前Tick数据（新增Time列解析时段特征）"""
         if self.cache_idx >= self.max_cache:
             return
         
-        # 缓存核心数据
+        # 缓存核心数据（新增Time列）
         self.e_price[self.cache_idx] = E_row.get('LastPrice', 0.0)
         self.e_vol[self.cache_idx] = E_row.get('TradeBuyVolume', 0.0) + E_row.get('TradeSellVolume', 0.0)
+        self.e_time[self.cache_idx] = E_row.get('Time', 0)  # 缓存数字格式时间戳
         
         # 计算收益率
         if self.cache_idx > 0:
@@ -173,7 +182,12 @@ class MyModel:
         else:
             self.e_return[self.cache_idx] = 0.0
         
-        # ========== 缓存9个因子所需字段 ==========
+        # ========== 新增：解析时段特征（调用utils中的get_trade_period_label） ==========
+        time_int = self.e_time[self.cache_idx]
+        period_label = get_trade_period_label(np.array([time_int]))[0]  # 单值解析
+        self.rolling['trade_period']['last_label'] = period_label
+        
+        # ========== 缓存9个数值因子所需字段 ==========
         # 买盘深度（buy_depth_ratio_enhanced）
         buy_depth = (
             E_row.get('BidVolume1', 0.0) + E_row.get('BidVolume2', 0.0) +
@@ -240,7 +254,7 @@ class MyModel:
         self._update_rolling_features()
 
     def online_predict(self, E_row, sector_rows):
-        """在线预测（9因子+加权+软阈值合并）"""
+        """在线预测（10因子+时段类别特征+新加权系数+软阈值合并）"""
         if not E_row or not sector_rows or len(sector_rows) != 4:
             return 0.0
         
@@ -248,15 +262,15 @@ class MyModel:
         self._cache_tick(E_row, sector_rows)
         i = self.cache_idx - 1
         
-        # 获取当前Tick的9个加权特征（适配FEATURE_CONFIG顺序）
+        # 获取当前Tick的10个加权特征（适配FEATURE_CONFIG顺序：9数值+1类别）
         current_feat = self.features[i:i+1, :]
         current_feat = clean_numeric_array(current_feat)
         
-        # 双模型预测（低复杂度模型）
+        # 双模型预测（含类别特征的低复杂度模型）
         try:
             # 方向模型：预测涨的概率（0-1）
             dir_pred = self.dir_model.predict(current_feat)[0]
-            # 强度模型：预测涨跌幅度（保留正负，不再取绝对值）
+            # 强度模型：预测涨跌幅度（保留正负）
             str_pred = self.str_model.predict(current_feat)[0]
             # 软阈值合并预测（0-1→-1到1连续值）
             final_pred = merge_double_predict(np.array([dir_pred]), np.array([str_pred]))[0]
@@ -264,5 +278,5 @@ class MyModel:
             final_pred = np.clip(final_pred, -0.1, 0.1)
             return float(final_pred)
         except Exception as e:
-            print(f"预测异常（Tick {i}）：{e}")
+            print(f"预测异常（Tick {i}，Time {self.e_time[i]}）：{e}")
             return 0.0
