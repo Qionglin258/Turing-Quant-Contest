@@ -42,9 +42,9 @@ def analyze_factor_value(all_ic_results, dir_importance, str_importance):
     return report_df
 
 def main():
-    # 1. 加载训练数据（1-3天）
+    # 1. 加载训练数据（1-4天）
     days = get_day_folders(DATA_DIR)
-    train_days = [d for d in days if int(d) < 4]
+    train_days = [d for d in days if int(d) <= 4]
     
     all_features = []
     all_labels = []
@@ -52,7 +52,7 @@ def main():
     all_strength_target = []
     all_ic_results = {feat: [] for feat in FEATURE_CONFIG}
     
-    print("===== 加载1-3天训练数据（已删除无效因子+因子加权） =====")
+    print("===== 加载训练数据 =====")
     for day in train_days:
         day_data = load_day_data(DATA_DIR, day)
         features, labels, dir_target, strength_target, single_ic = calculate_batch_features(day_data)

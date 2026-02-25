@@ -45,7 +45,7 @@ def main():
     # 获取所有交易日文件夹
     days = get_day_folders(DATA_DIR)
     
-    for day in ["4","5"]:
+    for day in ["5"]:
         print(f"\n===== 开始处理交易日 {day}（9因子+加权+低复杂度） =====")
         start_day = time.time()
         
